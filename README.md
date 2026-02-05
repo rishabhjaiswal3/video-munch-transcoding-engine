@@ -1,4 +1,4 @@
-# 🎬 I_TUBE Transcoding Engine
+# 🎬 Transcoding Engine
 
 **Standalone video transcoding microservice** for the I_TUBE platform.
 
