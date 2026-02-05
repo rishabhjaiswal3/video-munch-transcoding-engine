@@ -9,12 +9,15 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install production dependencies
-RUN npm install --production
+# Install ALL dependencies (including devDependencies for build)
+RUN npm install
 
 # Copy source and build
 COPY . .
 RUN npm run build
+
+# Remove devDependencies after build
+RUN npm prune --production
 
 # Create temp directory for video processing
 RUN mkdir -p /tmp/videomanch-transcoding
