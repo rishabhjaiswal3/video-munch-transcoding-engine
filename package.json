@@ -2,6 +2,7 @@
     "name": "videomanch-transcoding-engine",
     "version": "1.0.0",
     "description": "Standalone video transcoding engine with BullMQ worker",
+    "type": "module",
     "main": "dist/index.js",
     "scripts": {
         "dev": "tsx watch --clear-screen=false src/index.ts",
