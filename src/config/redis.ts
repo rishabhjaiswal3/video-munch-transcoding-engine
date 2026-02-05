@@ -13,8 +13,11 @@ export const getRedisConnection = (): Redis => {
         throw new Error('REDIS_URL is not defined in environment variables');
     }
 
+    const isTls = redisUrl.startsWith('rediss://');
+
     redisConnection = new Redis(redisUrl, {
         maxRetriesPerRequest: null,
+        ...(isTls && { tls: { rejectUnauthorized: false } }),
     });
 
     redisConnection.on('connect', () => {
