@@ -87,9 +87,9 @@ REDIS_URL=redis://localhost:6379
 R2_ACCOUNT_ID=your_account_id
 R2_ACCESS_KEY_ID=your_access_key_id
 R2_SECRET_ACCESS_KEY=your_secret_access_key
-R2_BUCKET_RAW=itube-raw
-R2_BUCKET_TRANSCODED=itube-transcoded
-R2_BUCKET_THUMBNAILS=itube-thumbnails
+R2_BUCKET_RAW=video-raw
+R2_BUCKET_TRANSCODED=video-transcoded
+R2_BUCKET_THUMBNAILS=video-thumbnails
 R2_PUBLIC_URL=https://your-public-url.com
 ```
 
@@ -134,8 +134,8 @@ Phase 1: Download → Phase 2: Probe → Phase 3: Transcode → Phase 4: Thumbna
 ```
 
 **Phase 1: Download Original Video**
-- Downloads from R2 `itube-raw` bucket
-- Saves to temp directory: `/tmp/itube-transcoding/{videoId}/`
+- Downloads from R2 `video-raw` bucket
+- Saves to temp directory: `/tmp/video-transcoding/{videoId}/`
 
 **Phase 2: Probe Video Metadata**
 - Extracts duration, resolution, codec info using FFprobe
@@ -152,7 +152,7 @@ Phase 1: Download → Phase 2: Probe → Phase 3: Transcode → Phase 4: Thumbna
 - Creates 1280×720 JPEG thumbnail
 
 **Phase 5: Upload to R2**
-- Uploads all transcoded videos to `itube-transcoded` bucket
+- Uploads all transcoded videos to `video-transcoded` bucket
 - Uploads thumbnail
 
 **Phase 6: Finalize**
@@ -203,7 +203,7 @@ Phase 1: Download → Phase 2: Probe → Phase 3: Transcode → Phase 4: Thumbna
 [TRANSCODE] 📊 Progress: 10% (10/85 weight units)
 
 [TRANSCODE] 🔍 PHASE 2: Probing video metadata
-[FFMPEG] 🔍 Probing video: /tmp/itube-transcoding/abc-123/original.mp4
+[FFMPEG] 🔍 Probing video: /tmp/video-transcoding/abc-123/original.mp4
 [FFMPEG] ✅ Probe successful
 [TRANSCODE] ⏱️ Video duration: 120.50s
 [TRANSCODE] 📐 Video dimensions: 1920x1080
@@ -403,14 +403,14 @@ The transcoding engine picks up and processes these jobs automatically.
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `MONGODB_URI` | MongoDB connection string | `mongodb://localhost:27017/itube` |
+| `MONGODB_URI` | MongoDB connection string | `mongodb://localhost:27017/video` |
 | `REDIS_URL` | Redis connection string | `redis://localhost:6379` |
 | `R2_ACCOUNT_ID` | Cloudflare R2 account ID | `abc123...` |
 | `R2_ACCESS_KEY_ID` | R2 access key | `your_key` |
 | `R2_SECRET_ACCESS_KEY` | R2 secret key | `your_secret` |
-| `R2_BUCKET_RAW` | Bucket for original videos | `itube-raw` |
-| `R2_BUCKET_TRANSCODED` | Bucket for transcoded videos | `itube-transcoded` |
-| `R2_BUCKET_THUMBNAILS` | Bucket for generated thumbnails | `itube-thumbnails` |
+| `R2_BUCKET_RAW` | Bucket for original videos | `video-raw` |
+| `R2_BUCKET_TRANSCODED` | Bucket for transcoded videos | `video-transcoded` |
+| `R2_BUCKET_THUMBNAILS` | Bucket for generated thumbnails | `video-thumbnails` |
 | `R2_PUBLIC_URL` | Public URL for R2 bucket | `https://cdn.example.com` |
 | `FFMPEG_PATH` | Custom FFmpeg binary path (optional) | `/usr/local/bin/ffmpeg` |
 | `FFPROBE_PATH` | Custom FFprobe binary path (optional) | `/usr/local/bin/ffprobe` |
