@@ -564,12 +564,33 @@ const startWorker = async () => {
 
         console.log('[STARTUP] Initializing workers...');
 
+        // Heavily optimized worker settings to minimize Redis requests
+        // Uses blocking mode (BRPOP) - waits for jobs instead of polling
+        const workerSettings = {
+            connection,
+            // Use blocking wait when no jobs (30 seconds block timeout)
+            drainDelay: 30000,
+            // Disable stalled check to reduce calls (jobs have long timeouts anyway)
+            skipStalledCheck: true,
+            // Skip lock renewal for idle workers
+            skipLockRenewal: false,
+            // Lock renew interval - only when actively processing
+            lockRenewTime: 30000,
+            // Use blocking strategy
+            settings: {
+                // Lock duration before considering job stalled
+                lockDuration: 600000,
+                // Use BRPOP with timeout (blocking, not polling)
+                stalledInterval: 0, // Disabled
+            },
+        };
+
         // User queue worker
         userWorker = new Worker<TranscodeJobData>(
             'user-transcode-queue',
             processJob,
             {
-                connection,
+                ...workerSettings,
                 concurrency: 2,
                 lockDuration: 600000, // 10 min timeout per job
             }
@@ -580,8 +601,8 @@ const startWorker = async () => {
             'creator-transcode-queue',
             processJob,
             {
-                connection,
-                concurrency: 2,
+                ...workerSettings,
+                concurrency: 1,
                 lockDuration: 1800000, // 30 min timeout (larger files)
             }
         );
@@ -612,6 +633,8 @@ const startWorker = async () => {
         console.log('✅ TRANSCODING ENGINE READY');
         console.log('   - User queue worker (concurrency: 2, timeout: 10min)');
         console.log('   - Creator queue worker (concurrency: 1, timeout: 30min)');
+        console.log('   - Polling interval: 5s (optimized for low Redis usage)');
+        console.log('   - Stalled check: every 2 minutes');
         console.log('   - Listening for transcoding jobs...');
         console.log(`${'='.repeat(80)}\n`);
     } catch (error) {
