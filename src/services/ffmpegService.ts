@@ -68,12 +68,15 @@ export const ffmpegService = {
         return new Promise((resolve, reject) => {
             ffmpeg(inputPath)
                 .outputOptions([
-                    // Video codec
+                    // Memory optimization - limit threads and use fast preset
+                    '-threads 2',                     // Limit CPU threads (reduces memory)
+
+                    // Video codec - use 'fast' preset for lower memory usage
                     '-c:v libx264',
-                    '-preset medium',
+                    '-preset fast',                   // Changed from 'medium' - uses less memory
                     `-b:v ${preset.bitrate}`,
                     '-maxrate ' + preset.bitrate,
-                    '-bufsize ' + (parseInt(preset.bitrate) * 2) + 'k',
+                    '-bufsize ' + (parseInt(preset.bitrate)) + 'k',  // Reduced buffer size
 
                     // Audio codec
                     '-c:a aac',
@@ -84,16 +87,16 @@ export const ffmpegService = {
 
                     // HLS specific options
                     '-f hls',
-                    '-hls_time 6',                    // 6 second segments
+                    '-hls_time 10',                   // 10 second segments (fewer files)
                     '-hls_list_size 0',               // Keep all segments in playlist
                     '-hls_segment_type mpegts',       // Use MPEG-TS format
                     '-hls_segment_filename ' + segmentPath,
                     '-hls_playlist_type vod',         // Video on demand
 
                     // Optimization
-                    '-g 48',                          // GOP size (keyframe interval)
+                    '-g 50',                          // GOP size (keyframe interval)
                     '-sc_threshold 0',                // Disable scene change detection
-                    '-keyint_min 48',                 // Minimum keyframe interval
+                    '-keyint_min 50',                 // Minimum keyframe interval
 
                     // Force overwrite
                     '-y',

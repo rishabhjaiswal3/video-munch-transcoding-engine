@@ -147,7 +147,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             }
         );
 
-        // Smart quality selection - don't upscale!
+        // Smart quality selection - don't upscale and skip same-resolution re-encoding
         const smartQualities = qualities.filter(quality => {
             const preset = QUALITY_PRESETS[quality];
             if (!preset) return false;
@@ -157,6 +157,14 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 console.log(`[TRANSCODE] ⚠️ Skipping ${quality} (${preset.height}p) - source is only ${originalHeight}p`);
                 return false;
             }
+
+            // Skip 1080p re-encoding if source is 1080p (saves memory/time)
+            // The 720p version will be the highest quality variant
+            if (preset.height === 1080 && originalHeight === 1080) {
+                console.log(`[TRANSCODE] ⚠️ Skipping ${quality} - source is already 1080p, using 720p as highest`);
+                return false;
+            }
+
             return true;
         });
 
