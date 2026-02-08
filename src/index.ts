@@ -593,27 +593,33 @@ const startWorker = async () => {
             },
         };
 
+        // Single worker handles both queues to minimize Redis connections
         // User queue worker
         userWorker = new Worker<TranscodeJobData>(
             'user-transcode-queue',
             processJob,
             {
                 ...workerSettings,
-                concurrency: 2,
+                concurrency: 1,  // Reduced to 1 to save memory/Redis calls
                 lockDuration: 600000, // 10 min timeout per job
             }
         );
 
-        // Creator queue worker
-        creatorWorker = new Worker<TranscodeJobData>(
-            'creator-transcode-queue',
-            processJob,
-            {
-                ...workerSettings,
-                concurrency: 1,
-                lockDuration: 1800000, // 30 min timeout (larger files)
-            }
-        );
+        // Only start creator worker if explicitly enabled (saves Redis calls)
+        const enableCreatorWorker = process.env.ENABLE_CREATOR_WORKER === 'true';
+        if (enableCreatorWorker) {
+            creatorWorker = new Worker<TranscodeJobData>(
+                'creator-transcode-queue',
+                processJob,
+                {
+                    ...workerSettings,
+                    concurrency: 1,
+                    lockDuration: 1800000, // 30 min timeout (larger files)
+                }
+            );
+        } else {
+            console.log('[STARTUP] Creator worker disabled (set ENABLE_CREATOR_WORKER=true to enable)');
+        }
 
         // Event handlers
         const setupEventHandlers = (worker: Worker, name: string) => {
@@ -635,12 +641,16 @@ const startWorker = async () => {
         };
 
         setupEventHandlers(userWorker, 'USER');
-        setupEventHandlers(creatorWorker, 'CREATOR');
+        if (creatorWorker) {
+            setupEventHandlers(creatorWorker, 'CREATOR');
+        }
 
         console.log(`\n${'='.repeat(80)}`);
         console.log('✅ TRANSCODING ENGINE READY');
-        console.log('   - User queue worker (concurrency: 2, timeout: 10min)');
-        console.log('   - Creator queue worker (concurrency: 1, timeout: 30min)');
+        console.log('   - User queue worker (concurrency: 1, timeout: 10min)');
+        if (creatorWorker) {
+            console.log('   - Creator queue worker (concurrency: 1, timeout: 30min)');
+        }
         console.log('   - Polling interval: 5s (optimized for low Redis usage)');
         console.log('   - Stalled check: every 2 minutes');
         console.log('   - Listening for transcoding jobs...');
