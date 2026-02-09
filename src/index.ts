@@ -572,24 +572,26 @@ const startWorker = async () => {
 
         console.log('[STARTUP] Initializing workers...');
 
-        // Heavily optimized worker settings to minimize Redis requests
-        // Uses blocking mode (BRPOP) - waits for jobs instead of polling
+        // Worker settings with stalled job recovery enabled
+        // Now using Railway Redis (unlimited requests), so we can enable proper job recovery
         const workerSettings = {
             connection,
             // Use blocking wait when no jobs (30 seconds block timeout)
             drainDelay: 30000,
-            // Disable stalled check to reduce calls (jobs have long timeouts anyway)
-            skipStalledCheck: true,
+            // Enable stalled check to recover interrupted jobs on redeploy
+            skipStalledCheck: false,
             // Skip lock renewal for idle workers
             skipLockRenewal: false,
             // Lock renew interval - only when actively processing
             lockRenewTime: 30000,
-            // Use blocking strategy
+            // Job recovery settings
             settings: {
-                // Lock duration before considering job stalled
+                // Lock duration before considering job stalled (10 minutes)
                 lockDuration: 600000,
-                // Use BRPOP with timeout (blocking, not polling)
-                stalledInterval: 0, // Disabled
+                // Check for stalled jobs every 2 minutes
+                stalledInterval: 120000,
+                // Max stalled count before marking as failed
+                maxStalledCount: 2,
             },
         };
 
@@ -651,8 +653,8 @@ const startWorker = async () => {
         if (creatorWorker) {
             console.log('   - Creator queue worker (concurrency: 1, timeout: 30min)');
         }
-        console.log('   - Polling interval: 5s (optimized for low Redis usage)');
-        console.log('   - Stalled check: every 2 minutes');
+        console.log('   - Stalled job recovery: enabled (checks every 2 min)');
+        console.log('   - Auto-retry on restart: yes (up to 3 attempts)');
         console.log('   - Listening for transcoding jobs...');
         console.log(`${'='.repeat(80)}\n`);
     } catch (error) {
