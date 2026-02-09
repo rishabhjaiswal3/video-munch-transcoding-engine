@@ -34,12 +34,25 @@ export const getRedisConnection = (): Redis => {
 export const disconnectRedis = async (): Promise<void> => {
     if (redisConnection) {
         try {
+            // Check if connection is already closed before attempting to quit
+            const status = redisConnection.status;
+            if (status === 'end' || status === 'close') {
+                console.log('[REDIS] ℹ️ Redis connection already closed');
+                redisConnection = null;
+                return;
+            }
             await redisConnection.quit();
             redisConnection = null;
             console.log('[REDIS] 🔌 Redis connection closed gracefully');
-        } catch (error) {
+        } catch (error: any) {
+            // Handle "Connection is closed" error gracefully
+            if (error?.message?.includes('Connection is closed')) {
+                console.log('[REDIS] ℹ️ Redis connection was already closed');
+                redisConnection = null;
+                return;
+            }
             console.error('[REDIS] ❌ Error closing Redis connection:', error);
-            throw error;
+            redisConnection = null;
         }
     }
 };

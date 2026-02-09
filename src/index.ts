@@ -431,6 +431,10 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         // console.log(`[TRANSCODE] 📦 Total files uploaded: ${totalFilesUploaded}`);
         // console.log(`${'='.repeat(80)}\n`);
 
+        // Remove job from Redis - status is tracked in MongoDB
+        console.log(`[TRANSCODE] 🗑️ Removing completed job from Redis...`);
+        await job.remove();
+
         activeJobs--;
         return { success: true, masterPlaylistUrl, outputs: uploadedOutputs };
     } catch (error: any) {
