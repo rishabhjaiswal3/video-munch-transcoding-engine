@@ -584,15 +584,9 @@ const startWorker = async () => {
             skipLockRenewal: false,
             // Lock renew interval - only when actively processing
             lockRenewTime: 30000,
-            // Job recovery settings
-            settings: {
-                // Lock duration before considering job stalled (10 minutes)
-                lockDuration: 600000,
-                // Check for stalled jobs every 2 minutes
-                stalledInterval: 120000,
-                // Max stalled count before marking as failed
-                maxStalledCount: 2,
-            },
+            // Stalled job recovery settings (top-level in BullMQ v5+)
+            stalledInterval: 120000,  // Check for stalled jobs every 2 minutes
+            maxStalledCount: 2,       // Max stalled count before marking as failed
         };
 
         // Single worker handles both queues to minimize Redis connections
