@@ -68,8 +68,8 @@ export const ffmpegService = {
         return new Promise((resolve, reject) => {
             ffmpeg(inputPath)
                 .outputOptions([
-                    // Memory optimization - limit threads and use fast preset
-                    '-threads 2',                     // Limit CPU threads (reduces memory)
+                    // CPU optimization - use 4 threads for better utilization
+                    '-threads 4',                     // Use 4 CPU threads for encoding
 
                     // Video codec - use 'fast' preset for lower memory usage
                     '-c:v libx264',
