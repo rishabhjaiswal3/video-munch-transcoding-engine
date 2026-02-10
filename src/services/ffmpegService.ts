@@ -1,4 +1,4 @@
-import ffmpeg, { FfprobeData } from 'fluent-ffmpeg';
+import ffmpeg, { FfprobeData, FfmpegCommand } from 'fluent-ffmpeg';
 import path from 'path';
 import fs from 'fs/promises';
 
@@ -9,6 +9,9 @@ if (process.env.FFMPEG_PATH) {
 if (process.env.FFPROBE_PATH) {
     ffmpeg.setFfprobePath(process.env.FFPROBE_PATH);
 }
+
+// Default timeout for FFmpeg operations (60 minutes per quality)
+const DEFAULT_FFMPEG_TIMEOUT_MS = 60 * 60 * 1000;
 
 export interface QualityPreset {
     width: number;
@@ -45,13 +48,15 @@ export const ffmpegService = {
     /**
      * Transcode a video to HLS format with adaptive bitrate streaming.
      * Generates .m3u8 playlist and .ts segment files.
+     * Includes timeout to prevent hanging on corrupted files.
      */
     transcodeToHLS(
         inputPath: string,
         outputDir: string,
         quality: string,
         preset: QualityPreset,
-        onProgress?: (percent: number) => void
+        onProgress?: (percent: number) => void,
+        timeoutMs: number = DEFAULT_FFMPEG_TIMEOUT_MS
     ): Promise<HLSOutput> {
         console.log(`[FFMPEG] ⚙️ Starting HLS transcode`);
         console.log(`[FFMPEG] 💾 Input: ${inputPath}`);
@@ -59,6 +64,7 @@ export const ffmpegService = {
         console.log(`[FFMPEG] 🎯 Quality: ${quality}`);
         console.log(`[FFMPEG] 📐 Resolution: ${preset.width}x${preset.height}`);
         console.log(`[FFMPEG] 🎚️ Bitrate: ${preset.bitrate} (video), ${preset.audioBitrate} (audio)`);
+        console.log(`[FFMPEG] ⏱️ Timeout: ${Math.round(timeoutMs / 60000)} minutes`);
 
         const playlistFilename = `${quality}.m3u8`;
         const segmentPattern = `${quality}_%03d.ts`;
@@ -66,7 +72,33 @@ export const ffmpegService = {
         const segmentPath = path.join(outputDir, segmentPattern);
 
         return new Promise((resolve, reject) => {
-            ffmpeg(inputPath)
+            let timeoutHandle: NodeJS.Timeout | null = null;
+            let isCompleted = false;
+            let lastProgressTime = Date.now();
+            let command: FfmpegCommand | null = null;
+
+            // Timeout handler - kills FFmpeg if it hangs
+            const setupTimeout = () => {
+                if (timeoutHandle) clearTimeout(timeoutHandle);
+                timeoutHandle = setTimeout(() => {
+                    if (!isCompleted && command) {
+                        const stuckDuration = Math.round((Date.now() - lastProgressTime) / 1000);
+                        console.error(`[FFMPEG] ⏰ Timeout! FFmpeg stuck for ${stuckDuration}s. Killing process...`);
+                        command.kill('SIGKILL');
+                        reject(new Error(`FFmpeg timeout after ${Math.round(timeoutMs / 60000)} minutes. Video may be corrupted or too complex.`));
+                    }
+                }, timeoutMs);
+            };
+
+            // Reset timeout on progress (FFmpeg is still working)
+            const resetTimeout = () => {
+                lastProgressTime = Date.now();
+                setupTimeout();
+            };
+
+            setupTimeout();
+
+            command = ffmpeg(inputPath)
                 .outputOptions([
                     // CPU optimization - use 4 threads for better utilization
                     '-threads 4',                     // Use 4 CPU threads for encoding
@@ -103,11 +135,14 @@ export const ffmpegService = {
                 ])
                 .output(playlistPath)
                 .on('progress', (progress) => {
+                    resetTimeout(); // FFmpeg is making progress, reset timeout
                     if (onProgress && progress.percent !== undefined) {
                         onProgress(Math.round(progress.percent));
                     }
                 })
                 .on('end', async () => {
+                    isCompleted = true;
+                    if (timeoutHandle) clearTimeout(timeoutHandle);
                     console.log(`[FFMPEG] ✅ HLS transcode complete`);
 
                     // Count generated segments
@@ -130,10 +165,13 @@ export const ffmpegService = {
                     }
                 })
                 .on('error', (err) => {
+                    isCompleted = true;
+                    if (timeoutHandle) clearTimeout(timeoutHandle);
                     console.error(`[FFMPEG] ❌ HLS transcode failed:`, err.message);
                     reject(err);
-                })
-                .run();
+                });
+
+            command.run();
         });
     },
 

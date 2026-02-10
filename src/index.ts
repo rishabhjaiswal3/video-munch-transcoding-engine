@@ -10,6 +10,150 @@ import { ffmpegService, QualityPreset } from './services/ffmpegService.js';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { execSync } from 'child_process';
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+// Railway provides ~8GB disk space in /tmp by default
+// But it's shared, so be conservative
+const MIN_REQUIRED_DISK_SPACE_MULTIPLIER = 3; // Need ~3x file size (input + outputs)
+const MIN_FREE_DISK_BYTES = 500 * 1024 * 1024; // Minimum 500MB free
+
+// Memory thresholds (Railway free tier: 512MB, Pro: up to 8GB)
+const MEMORY_THRESHOLD_PERCENT = 85; // Pause if memory usage > 85%
+
+// Progress update throttling (prevent Redis overwhelm)
+const PROGRESS_UPDATE_INTERVAL_MS = 2000; // Max 1 update per 2 seconds
+
+// FFmpeg timeout (prevent hanging on corrupted files)
+const FFMPEG_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes max per quality
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+/**
+ * Get available disk space in bytes for a given path
+ * Works on both Linux (Railway) and macOS (local dev)
+ */
+const getAvailableDiskSpace = async (targetPath: string): Promise<number> => {
+    try {
+        // Ensure the directory exists
+        await fs.mkdir(targetPath, { recursive: true });
+
+        if (process.platform === 'win32') {
+            // Windows - not supported in production but handle for local dev
+            return Number.MAX_SAFE_INTEGER;
+        }
+
+        // Unix/Linux/macOS - use df command
+        const output = execSync(`df -k "${targetPath}" | tail -1 | awk '{print $4}'`, {
+            encoding: 'utf-8',
+        }).trim();
+
+        const availableKB = parseInt(output, 10);
+        if (Number.isFinite(availableKB)) {
+            return availableKB * 1024; // Convert KB to bytes
+        }
+
+        console.warn('[DISK] Could not parse disk space, assuming unlimited');
+        return Number.MAX_SAFE_INTEGER;
+    } catch (error) {
+        console.error('[DISK] Error checking disk space:', error);
+        // On Railway, /tmp is memory-backed, so check available memory instead
+        const memInfo = process.memoryUsage();
+        const heapAvailable = memInfo.heapTotal - memInfo.heapUsed;
+        return heapAvailable * 2; // Rough estimate
+    }
+};
+
+/**
+ * Check if system has enough memory to process
+ * Returns { canProcess: boolean, usagePercent: number, availableMB: number }
+ */
+const checkMemoryUsage = (): { canProcess: boolean; usagePercent: number; availableMB: number } => {
+    const totalMemory = os.totalmem();
+    const freeMemory = os.freemem();
+    const usedMemory = totalMemory - freeMemory;
+    const usagePercent = Math.round((usedMemory / totalMemory) * 100);
+    const availableMB = Math.round(freeMemory / (1024 * 1024));
+
+    return {
+        canProcess: usagePercent < MEMORY_THRESHOLD_PERCENT,
+        usagePercent,
+        availableMB,
+    };
+};
+
+/**
+ * Sleep utility for retry delays
+ */
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Retry wrapper with exponential backoff
+ */
+const withRetry = async <T>(
+    fn: () => Promise<T>,
+    maxRetries: number = 3,
+    baseDelayMs: number = 1000,
+    operationName: string = 'operation'
+): Promise<T> => {
+    let lastError: Error | null = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error: any) {
+            lastError = error;
+            console.warn(`[RETRY] ${operationName} failed (attempt ${attempt}/${maxRetries}): ${error.message}`);
+
+            if (attempt < maxRetries) {
+                const delay = baseDelayMs * Math.pow(2, attempt - 1);
+                console.log(`[RETRY] Waiting ${delay}ms before retry...`);
+                await sleep(delay);
+            }
+        }
+    }
+
+    throw lastError;
+};
+
+/**
+ * Create a throttled progress reporter
+ * Only reports progress at most once per interval
+ */
+const createThrottledProgressReporter = (
+    job: Job,
+    updateVideoProgress: (videoId: string, progress: number) => Promise<void>,
+    videoId: string
+) => {
+    let lastUpdateTime = 0;
+    let lastReportedPercent = -1;
+
+    return async (percent: number) => {
+        const now = Date.now();
+
+        // Always report 0 and 100
+        const isImportant = percent === 0 || percent === 100 || percent - lastReportedPercent >= 10;
+        const throttleExpired = now - lastUpdateTime >= PROGRESS_UPDATE_INTERVAL_MS;
+
+        if (isImportant || throttleExpired) {
+            lastUpdateTime = now;
+            lastReportedPercent = percent;
+
+            // Update BullMQ job progress (Redis) - fire and forget
+            job.updateProgress(percent).catch(() => { });
+
+            // Update MongoDB only for significant changes (every 10%)
+            if (percent % 10 === 0 || percent === 100) {
+                await updateVideoProgress(videoId, percent);
+            }
+        }
+    };
+};
 
 // console.log(`\n${'='.repeat(80)}`);
 // console.log('🎬 I_TUBE TRANSCODING ENGINE');
@@ -26,6 +170,29 @@ const QUALITY_PRESETS: Record<string, QualityPreset> = {
 };
 
 const TEMP_BASE_DIR = path.join(os.tmpdir(), 'videomanch-transcoding');
+
+// Safe FPS parsing - replaces dangerous eval()
+// Handles formats like "30/1", "30000/1001", "30", "29.97"
+const parseFps = (fpsString: string | undefined): number => {
+    if (!fpsString) return 0;
+
+    // Handle fraction format (e.g., "30/1" or "30000/1001")
+    if (fpsString.includes('/')) {
+        const parts = fpsString.split('/');
+        if (parts.length === 2) {
+            const numerator = parseFloat(parts[0]);
+            const denominator = parseFloat(parts[1]);
+            if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator !== 0) {
+                return numerator / denominator;
+            }
+        }
+        return 0;
+    }
+
+    // Handle decimal format (e.g., "29.97")
+    const parsed = parseFloat(fpsString);
+    return Number.isFinite(parsed) ? parsed : 0;
+};
 
 // Track workers for graceful shutdown
 let userWorker: Worker<TranscodeJobData> | null = null;
@@ -70,10 +237,82 @@ const processJob = async (job: Job<TranscodeJobData>) => {
     console.log(`${'='.repeat(80)}\n`);
 
     try {
+        // --- Pre-flight checks ---
+        console.log(`[TRANSCODE] 🔍 Running pre-flight checks...`);
+
+        // Check memory availability
+        const memCheck = checkMemoryUsage();
+        console.log(`[TRANSCODE] 💾 Memory: ${memCheck.usagePercent}% used, ${memCheck.availableMB}MB available`);
+        if (!memCheck.canProcess) {
+            throw new Error(`Insufficient memory: ${memCheck.usagePercent}% used (threshold: ${MEMORY_THRESHOLD_PERCENT}%). Please try again later.`);
+        }
+
         // --- Setup ---
         console.log(`[TRANSCODE] 📂 Creating temp directory...`);
         await fs.mkdir(tempDir, { recursive: true });
         console.log(`[TRANSCODE] ✅ Temp directory created`);
+
+        // Get file size from R2 metadata BEFORE downloading
+        console.log(`[TRANSCODE] 📊 Checking file size from R2...`);
+        const r2Metadata = await r2Service.getFileMetadata(R2_BUCKETS.RAW, r2Key);
+        if (!r2Metadata) {
+            throw new Error(`File not found in R2: ${r2Key}`);
+        }
+        const expectedFileSize = r2Metadata.size;
+        console.log(`[TRANSCODE] 📦 Expected file size: ${(expectedFileSize / (1024 * 1024)).toFixed(2)} MB`);
+
+        // Check disk space (need ~3x file size: 1x original + 2x for transcoded outputs)
+        const requiredSpace = expectedFileSize * MIN_REQUIRED_DISK_SPACE_MULTIPLIER;
+        const availableSpace = await getAvailableDiskSpace(TEMP_BASE_DIR);
+        console.log(`[TRANSCODE] 💿 Disk space: ${(availableSpace / (1024 * 1024)).toFixed(0)}MB available, ${(requiredSpace / (1024 * 1024)).toFixed(0)}MB required`);
+
+        if (availableSpace < requiredSpace || availableSpace < MIN_FREE_DISK_BYTES) {
+            // Clean up stale temp directories - but ONLY if video is not actively processing
+            console.log(`[TRANSCODE] 🧹 Attempting to clean up stale temp directories...`);
+            try {
+                const tempContents = await fs.readdir(TEMP_BASE_DIR);
+                for (const dir of tempContents) {
+                    // Skip our own directory
+                    if (dir === videoId) continue;
+
+                    const dirPath = path.join(TEMP_BASE_DIR, dir);
+                    const stat = await fs.stat(dirPath);
+
+                    // Only consider directories older than 30 minutes
+                    const isOld = Date.now() - stat.mtimeMs > 30 * 60 * 1000;
+                    if (!isOld) continue;
+
+                    // CRITICAL: Check MongoDB to ensure this video is not actively processing
+                    // The directory name IS the videoId
+                    const otherVideo = await Video.findOne({ videoId: dir });
+
+                    // Safe to delete if:
+                    // 1. Video doesn't exist in DB (orphaned directory)
+                    // 2. Video exists but is NOT in 'processing' status
+                    const isActivelyProcessing = otherVideo?.status === 'processing';
+
+                    if (!isActivelyProcessing) {
+                        await fs.rm(dirPath, { recursive: true, force: true });
+                        console.log(`[TRANSCODE] 🗑️ Cleaned up stale directory: ${dir} (status: ${otherVideo?.status || 'not found'})`);
+                    } else {
+                        console.log(`[TRANSCODE] ⚠️ Skipping active directory: ${dir} (status: processing)`);
+                    }
+                }
+            } catch (cleanupError) {
+                // Ignore cleanup errors
+            }
+
+            // Re-check space after cleanup
+            const spaceAfterCleanup = await getAvailableDiskSpace(TEMP_BASE_DIR);
+            if (spaceAfterCleanup < requiredSpace || spaceAfterCleanup < MIN_FREE_DISK_BYTES) {
+                throw new Error(
+                    `Insufficient disk space: ${(spaceAfterCleanup / (1024 * 1024)).toFixed(0)}MB available, ` +
+                    `${(requiredSpace / (1024 * 1024)).toFixed(0)}MB required. ` +
+                    `Video file is ${(expectedFileSize / (1024 * 1024)).toFixed(0)}MB. ` +
+                    `Try with a smaller video or wait for other jobs to complete.`
+                );
+            }
+        }
 
         console.log(`[TRANSCODE] 💾 Updating video status to 'processing'...`);
         await Video.findOneAndUpdate(
@@ -90,12 +329,14 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         const totalWeight = 10 + (qualities.length * 20) + 5 + 5;
         let completedWeight = 0;
 
+        // Create throttled progress reporter to prevent Redis overwhelm
+        const throttledProgress = createThrottledProgressReporter(job, updateVideoProgress, videoId);
+
         const reportProgress = async (weight: number) => {
             completedWeight += weight;
             const percent = Math.min(Math.round((completedWeight / totalWeight) * 100), 99);
             console.log(`[TRANSCODE] 📊 Progress: ${percent}% (${completedWeight}/${totalWeight} weight units)`);
-            await job.updateProgress(percent);
-            await updateVideoProgress(videoId, percent);
+            await throttledProgress(percent);
         };
 
         // --- Phase 1: Download original from R2 ---
@@ -106,7 +347,14 @@ const processJob = async (job: Job<TranscodeJobData>) => {
 
         console.log(`[TRANSCODE] ☁️ R2 Key: ${r2Key}`);
         console.log(`[TRANSCODE] 💾 Local path: ${inputPath}`);
-        await r2Service.downloadToFile(R2_BUCKETS.RAW, r2Key, inputPath);
+
+        // Download with retry logic
+        await withRetry(
+            () => r2Service.downloadToFile(R2_BUCKETS.RAW, r2Key, inputPath),
+            3,
+            2000,
+            'R2 download'
+        );
         kpis.timings.download = Date.now() - downloadStartTime;
 
         // Get original file size
@@ -121,11 +369,28 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         const probeData = await ffmpegService.probe(inputPath);
         const duration = probeData.format.duration || 0;
         const videoStream = probeData.streams.find(s => s.codec_type === 'video');
-        const originalWidth = videoStream?.width || 0;
-        const originalHeight = videoStream?.height || 0;
-        const originalCodec = videoStream?.codec_name;
+
+        // Validate video stream exists
+        if (!videoStream) {
+            throw new Error('Invalid video file: No video stream found. This may be an audio-only file or corrupted.');
+        }
+
+        const originalWidth = videoStream.width || 0;
+        const originalHeight = videoStream.height || 0;
+
+        // Validate video dimensions
+        if (originalWidth < 64 || originalHeight < 64) {
+            throw new Error(`Invalid video dimensions: ${originalWidth}x${originalHeight}. Minimum supported is 64x64.`);
+        }
+
+        // Validate duration
+        if (duration <= 0) {
+            throw new Error('Invalid video: Could not determine duration. File may be corrupted.');
+        }
+
+        const originalCodec = videoStream.codec_name;
         const originalBitrate = parseInt(String(probeData.format.bit_rate || '0'));
-        const originalFps = videoStream?.r_frame_rate ? eval(videoStream.r_frame_rate) : 0;
+        const originalFps = parseFps(videoStream.r_frame_rate);
 
         console.log(`[TRANSCODE] ⏱️ Video duration: ${duration.toFixed(2)}s`);
         console.log(`[TRANSCODE] 📐 Video dimensions: ${originalWidth}x${originalHeight}`);
@@ -204,6 +469,13 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 console.log(`[TRANSCODE] ⚠️ Shutdown requested, completing current quality before stopping...`);
             }
 
+            // Check memory before each quality transcoding
+            const memCheckBeforeQuality = checkMemoryUsage();
+            if (!memCheckBeforeQuality.canProcess) {
+                console.warn(`[TRANSCODE] ⚠️ Memory high (${memCheckBeforeQuality.usagePercent}%), waiting 10s before ${smartQualities[i]}...`);
+                await sleep(10000);
+            }
+
             const quality = smartQualities[i];
             const preset = QUALITY_PRESETS[quality];
             if (!preset) {
@@ -211,14 +483,12 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 continue;
             }
 
-            // console.log(`\n[TRANSCODE] 🎞️ Transcoding quality ${i + 1}/${qualities.length}: ${quality}`);
-            // console.log(`[TRANSCODE] 📐 Target resolution: ${preset.width}x${preset.height}`);
-            // console.log(`[TRANSCODE] 🎚️ Video bitrate: ${preset.bitrate}, Audio bitrate: ${preset.audioBitrate}`);
-            // console.log(`[TRANSCODE] ⏱️ Video duration: ${duration.toFixed(2)}s`);
-            // console.log(`[TRANSCODE] 🔄 Starting HLS encoding...`);
+            console.log(`\n[TRANSCODE] 🎞️ Transcoding quality ${i + 1}/${smartQualities.length}: ${quality}`);
+            console.log(`[TRANSCODE] 📐 Target resolution: ${preset.width}x${preset.height}`);
 
             const startTime = Date.now();
             let lastLoggedPercent = 0;
+            let lastProgressUpdate = 0;
 
             const hlsOutput = await ffmpegService.transcodeToHLS(
                 inputPath,
@@ -226,6 +496,17 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 quality,
                 preset,
                 (percent) => {
+                    const now = Date.now();
+
+                    // Throttle progress updates to prevent Redis overwhelm
+                    const shouldUpdate =
+                        percent === 0 ||
+                        percent === 100 ||
+                        now - lastProgressUpdate >= PROGRESS_UPDATE_INTERVAL_MS;
+
+                    if (!shouldUpdate) return;
+                    lastProgressUpdate = now;
+
                     // Fine-grained progress to BullMQ/Redis only (not MongoDB)
                     const qualityWeight = (percent / 100) * 20;
                     const overallPercent = Math.round(
@@ -240,6 +521,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                         lastLoggedPercent = percent;
                     }
 
+                    // Throttled update to Redis
                     job.updateProgress(overallPercent).catch(() => { });
                 }
             );
@@ -304,7 +586,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         );
 
         // --- Phase 5: Upload HLS files to R2 TRANSCODED bucket ---
-        console.log(`\n[TRANSCODE] ☁️ PHASE 5: Uploading HLS files to R2`);
+        console.log(`\n[TRANSCODE] ☁️ PHASE 5: Uploading HLS files to R2 (with retry)`);
         const uploadedOutputs = [];
         let totalFilesUploaded = 0;
 
@@ -314,29 +596,35 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             console.log(`\n[TRANSCODE] 📤 Uploading quality ${i + 1}/${hlsOutputs.length}: ${output.quality}`);
             console.log(`[TRANSCODE] 📊 Files: 1 playlist + ${output.segmentCount} segments`);
 
-            // Upload playlist (.m3u8)
+            // Upload playlist (.m3u8) with retry
             const playlistKey = `${userType}/${userId}/${videoId}/${output.quality}.m3u8`;
             console.log(`[TRANSCODE] 📤 Uploading playlist: ${output.quality}.m3u8`);
-            await r2Service.uploadFromFile(
-                R2_BUCKETS.TRANSCODED,
-                playlistKey,
-                output.playlistPath,
-                'application/vnd.apple.mpegurl'
+            await withRetry(
+                () => r2Service.uploadFromFile(
+                    R2_BUCKETS.TRANSCODED,
+                    playlistKey,
+                    output.playlistPath,
+                    'application/vnd.apple.mpegurl'
+                ),
+                3, 2000, `upload ${output.quality}.m3u8`
             );
             totalFilesUploaded++;
 
-            // Upload all .ts segments
+            // Upload all .ts segments with retry
             let totalSegmentSize = 0;
             for (let j = 0; j < output.segmentFiles.length; j++) {
                 const segmentFile = output.segmentFiles[j];
                 const segmentFilename = path.basename(segmentFile);
                 const segmentKey = `${userType}/${userId}/${videoId}/${segmentFilename}`;
 
-                const { size } = await r2Service.uploadFromFile(
-                    R2_BUCKETS.TRANSCODED,
-                    segmentKey,
-                    segmentFile,
-                    'video/mp2t'
+                const { size } = await withRetry(
+                    () => r2Service.uploadFromFile(
+                        R2_BUCKETS.TRANSCODED,
+                        segmentKey,
+                        segmentFile,
+                        'video/mp2t'
+                    ),
+                    3, 1000, `upload segment ${segmentFilename}`
                 );
                 totalSegmentSize += size;
                 totalFilesUploaded++;
@@ -347,7 +635,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 }
             }
 
-            // console.log(`[TRANSCODE] ✅ ${output.quality} uploaded (${(totalSegmentSize / (1024 * 1024)).toFixed(2)} MB)`);
+            console.log(`[TRANSCODE] ✅ ${output.quality} uploaded (${(totalSegmentSize / (1024 * 1024)).toFixed(2)} MB)`);
 
             // Track size in KPIs
             if (output.quality === '1080p') kpis.sizes['1080p'] = totalSegmentSize;
@@ -365,33 +653,40 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             });
         }
 
-        // Upload master playlist
-        // console.log(`\n[TRANSCODE] 📤 Uploading master playlist...`);
+        // Upload master playlist with retry
+        console.log(`\n[TRANSCODE] 📤 Uploading master playlist...`);
         const masterPlaylistKey = `${userType}/${userId}/${videoId}/master.m3u8`;
-        await r2Service.uploadFromFile(
-            R2_BUCKETS.TRANSCODED,
-            masterPlaylistKey,
-            masterPlaylistPath,
-            'application/vnd.apple.mpegurl'
+        await withRetry(
+            () => r2Service.uploadFromFile(
+                R2_BUCKETS.TRANSCODED,
+                masterPlaylistKey,
+                masterPlaylistPath,
+                'application/vnd.apple.mpegurl'
+            ),
+            3, 2000, 'upload master.m3u8'
         );
         totalFilesUploaded++;
-        // console.log(`[TRANSCODE] ✅ Master playlist uploaded`);
+        console.log(`[TRANSCODE] ✅ Master playlist uploaded`);
 
-        // Upload thumbnails
+        // Upload thumbnails with retry
         const uploadStartTime = Date.now();
-        // console.log(`\n[TRANSCODE] 📤 Uploading ${thumbnailPaths.length} thumbnails...`);
+        console.log(`\n[TRANSCODE] 📤 Uploading ${thumbnailPaths.length} thumbnails...`);
         const thumbnailUrls: string[] = [];
 
         for (let i = 0; i < thumbnailPaths.length; i++) {
-            await r2Service.uploadFromFile(
-                R2_BUCKETS.THUMBNAILS,
-                thumbnailKeys[i],
-                thumbnailPaths[i],
-                'image/jpeg'
+            await withRetry(
+                () => r2Service.uploadFromFile(
+                    R2_BUCKETS.THUMBNAILS,
+                    thumbnailKeys[i],
+                    thumbnailPaths[i],
+                    'image/jpeg'
+                ),
+                3, 1000, `upload thumbnail ${i + 1}`
             );
             thumbnailUrls.push(r2Service.getPublicUrl(thumbnailKeys[i], R2_BUCKETS.THUMBNAILS));
             totalFilesUploaded++;
         }
+        console.log(`[TRANSCODE] ✅ All thumbnails uploaded`);
 
         kpis.timings.upload = Date.now() - uploadStartTime;
         // console.log(`[TRANSCODE] ✅ All ${thumbnailPaths.length} thumbnails uploaded`);
@@ -424,16 +719,19 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             }
         );
 
-        // console.log(`[TRANSCODE] ✅ Video status updated to 'completed'`);
-        // console.log(`[TRANSCODE] 🎬 Master playlist: ${masterPlaylistUrl}`);
-        // console.log(`[TRANSCODE] 🎉 Job ${job.id} completed successfully!`);
-        // console.log(`[TRANSCODE] 📊 Generated ${uploadedOutputs.length} HLS quality variants`);
-        // console.log(`[TRANSCODE] 📦 Total files uploaded: ${totalFilesUploaded}`);
-        // console.log(`${'='.repeat(80)}\n`);
+        console.log(`[TRANSCODE] ✅ Video status updated to 'completed'`);
+        console.log(`[TRANSCODE] 🎉 Job ${job.id} completed successfully!`);
 
-        // Remove job from Redis - status is tracked in MongoDB
-        console.log(`[TRANSCODE] 🗑️ Removing completed job from Redis...`);
-        await job.remove();
+        // Remove job from Redis after DB confirmation - status is tracked in MongoDB
+        // Wrapped in try-catch since job might already be removed by BullMQ's removeOnComplete
+        try {
+            console.log(`[TRANSCODE] 🗑️ Removing completed job from Redis...`);
+            await job.remove();
+            console.log(`[TRANSCODE] ✅ Job removed from Redis`);
+        } catch (removeError) {
+            // Not critical - BullMQ's removeOnComplete will handle it
+            console.log(`[TRANSCODE] ⚠️ Job already removed from Redis (expected behavior)`);
+        }
 
         activeJobs--;
         return { success: true, masterPlaylistUrl, outputs: uploadedOutputs };
@@ -450,8 +748,16 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 'transcoding.error': error.message || 'Unknown transcoding error',
             }
         );
-        // console.log(`[TRANSCODE] ✅ Video status updated to 'failed'`);
-        // console.log(`${'='.repeat(80)}\n`);
+        console.log(`[TRANSCODE] ✅ Video status updated to 'failed'`);
+
+        // Remove failed job from Redis after DB confirmation
+        try {
+            await job.remove();
+            console.log(`[TRANSCODE] 🗑️ Failed job removed from Redis`);
+        } catch (removeError) {
+            // Not critical - BullMQ's removeOnFail will handle it
+            console.log(`[TRANSCODE] ⚠️ Job already removed from Redis`);
+        }
 
         activeJobs--;
         throw error;
