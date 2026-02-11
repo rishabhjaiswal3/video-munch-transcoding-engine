@@ -647,7 +647,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
 
             uploadedOutputs.push({
                 quality: output.quality,
-                playlistUrl: r2Service.getPublicUrl(playlistKey),
+                playlistUrl: playlistKey,  // Store only path, frontend constructs full URL
                 segmentCount: output.segmentCount,
                 size: totalSegmentSize,
             });
@@ -683,7 +683,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 ),
                 3, 1000, `upload thumbnail ${i + 1}`
             );
-            thumbnailUrls.push(r2Service.getPublicUrl(thumbnailKeys[i], R2_BUCKETS.THUMBNAILS));
+            thumbnailUrls.push(thumbnailKeys[i]);  // Store only path, frontend constructs full URL
             totalFilesUploaded++;
         }
         console.log(`[TRANSCODE] ✅ All thumbnails uploaded`);
@@ -702,13 +702,12 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         // console.log(`\n[TRANSCODE] 💾 PHASE 6: Finalizing in database`);
         await job.updateProgress(100);
 
-        const masterPlaylistUrl = r2Service.getPublicUrl(masterPlaylistKey);
-
+        // Store only the R2 key (path), frontend constructs full URL using R2 bucket constants
         await Video.findOneAndUpdate(
             { videoId },
             {
                 status: 'completed',
-                masterPlaylistUrl,  // HLS master playlist URL
+                masterPlaylistUrl: masterPlaylistKey,  // Store only path, frontend constructs full URL
                 outputs: uploadedOutputs,  // Array of quality variants
                 thumbnail: thumbnailUrls[0],  // Primary thumbnail
                 thumbnails: thumbnailUrls,    // All thumbnails
@@ -734,7 +733,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         }
 
         activeJobs--;
-        return { success: true, masterPlaylistUrl, outputs: uploadedOutputs };
+        return { success: true, masterPlaylistUrl: masterPlaylistKey, outputs: uploadedOutputs };
     } catch (error: any) {
         // console.error(`\n[TRANSCODE] ❌ Job ${job.id} FAILED`);
         // console.error(`[TRANSCODE] 💥 Error: ${error.message}`);
