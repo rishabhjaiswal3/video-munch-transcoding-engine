@@ -703,6 +703,10 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         await job.updateProgress(100);
 
         // Store only the R2 key (path), frontend constructs full URL using R2 bucket constants
+        console.log(`[TRANSCODE] 💾 Saving to DB - masterPlaylistUrl: ${masterPlaylistKey}`);
+        console.log(`[TRANSCODE] 💾 Saving to DB - thumbnail: ${thumbnailUrls[0]}`);
+        console.log(`[TRANSCODE] 💾 Saving to DB - outputs:`, JSON.stringify(uploadedOutputs, null, 2));
+
         await Video.findOneAndUpdate(
             { videoId },
             {
