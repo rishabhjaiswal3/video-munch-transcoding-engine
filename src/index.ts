@@ -707,6 +707,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             { videoId },
             {
                 status: 'completed',
+                transcodingCompleted: true,  // Mark transcoding as complete
                 masterPlaylistUrl: masterPlaylistKey,  // Store only path, frontend constructs full URL
                 outputs: uploadedOutputs,  // Array of quality variants
                 thumbnail: thumbnailUrls[0],  // Primary thumbnail
