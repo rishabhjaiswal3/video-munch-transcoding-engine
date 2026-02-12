@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Worker, Job } from 'bullmq';
-import { getRedisConnection, disconnectRedis } from './config/redis.js';
+import { getRedisConfig, disconnectRedis } from './config/redis.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { Video } from './models/Video.js';
 import { TranscodeJobData } from './types/index.js';
@@ -875,15 +875,15 @@ const startWorker = async () => {
         console.log('[STARTUP] Connecting to MongoDB...');
         await connectDatabase();
 
-        console.log('[STARTUP] Connecting to Redis...');
-        const connection = getRedisConnection();
+        console.log('[STARTUP] Getting Redis config...');
+        const redisConfig = getRedisConfig();
 
         console.log('[STARTUP] Initializing workers...');
 
         // Worker settings with stalled job recovery enabled
         // Now using Railway Redis (unlimited requests), so we can enable proper job recovery
         const workerSettings = {
-            connection,
+            connection: redisConfig,
             // Use blocking wait when no jobs (30 seconds block timeout)
             drainDelay: 30000,
             // Enable stalled check to recover interrupted jobs on redeploy

@@ -1,14 +1,43 @@
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 
 let redisConnection: Redis | null = null;
 
+// Parse Redis URL into host/port/password for BullMQ
+const parseRedisUrl = (url: string) => {
+    const parsed = new URL(url);
+    return {
+        host: parsed.hostname,
+        port: parseInt(parsed.port || '6379', 10),
+        password: parsed.password || undefined,
+        username: parsed.username || undefined,
+    };
+};
+
+// Connection config for BullMQ (it creates its own connections)
+export const getRedisConfig = () => {
+    const redisUrl = process.env.REDIS_URL;
+
+    if (!redisUrl) {
+        throw new Error('REDIS_URL is not defined in environment variables');
+    }
+
+    const isTls = redisUrl.startsWith('rediss://');
+    const parsed = parseRedisUrl(redisUrl);
+
+    return {
+        ...parsed,
+        maxRetriesPerRequest: null,
+        ...(isTls && { tls: { rejectUnauthorized: false } }),
+    };
+};
+
+// Shared connection for non-BullMQ usage
 export const getRedisConnection = (): Redis => {
     if (redisConnection) {
         return redisConnection;
     }
 
     const redisUrl = process.env.REDIS_URL;
-
     if (!redisUrl) {
         throw new Error('REDIS_URL is not defined in environment variables');
     }
