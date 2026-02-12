@@ -121,16 +121,25 @@ export const r2Service = {
         console.log(`[R2] 📂 Bucket: ${bucket}, Key: ${key}`);
         console.log(`[R2] 📦 Size: ${(fileStats.size / (1024 * 1024)).toFixed(2)} MB`);
 
+        // Determine cache control based on file type
+        // - Video segments (.ts) and thumbnails are immutable, cache for 1 year
+        // - Playlists (.m3u8) should have shorter cache for potential updates
+        let cacheControl = 'public, max-age=31536000, immutable'; // 1 year for segments
+        if (key.endsWith('.m3u8')) {
+            cacheControl = 'public, max-age=3600'; // 1 hour for playlists
+        }
+
         const command = new PutObjectCommand({
             Bucket: bucket,
             Key: key,
             Body: fileStream,
             ContentType: contentType,
             ContentLength: fileStats.size,
+            CacheControl: cacheControl,
         });
 
         await client.send(command);
-        console.log(`[R2] ✅ Upload complete`);
+        console.log(`[R2] ✅ Upload complete (Cache: ${cacheControl})`);
 
         return { size: fileStats.size };
     },
