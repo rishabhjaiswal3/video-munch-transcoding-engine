@@ -143,4 +143,50 @@ export const r2Service = {
 
         return { size: fileStats.size };
     },
+
+    /**
+     * Upload a live segment directly from buffer
+     * Segments are immutable - cache for 1 year
+     */
+    async uploadLiveSegment(
+        key: string,
+        content: Buffer,
+        contentType: string = 'video/mp2t'
+    ): Promise<void> {
+        const client = getR2Client();
+        const bucket = process.env.R2_BUCKET_LIVE || R2_BUCKETS.TRANSCODED;
+
+        const command = new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: content,
+            ContentType: contentType,
+            ContentLength: content.length,
+            CacheControl: 'public, max-age=31536000, immutable', // 1 year
+        });
+
+        await client.send(command);
+    },
+
+    /**
+     * Upload a live playlist directly from string
+     * Playlists must always be fresh - no caching
+     */
+    async uploadLivePlaylist(
+        key: string,
+        content: string
+    ): Promise<void> {
+        const client = getR2Client();
+        const bucket = process.env.R2_BUCKET_LIVE || R2_BUCKETS.TRANSCODED;
+
+        const command = new PutObjectCommand({
+            Bucket: bucket,
+            Key: key,
+            Body: Buffer.from(content, 'utf-8'),
+            ContentType: 'application/vnd.apple.mpegurl',
+            CacheControl: 'no-cache, no-store, must-revalidate', // Always fetch fresh
+        });
+
+        await client.send(command);
+    },
 };
