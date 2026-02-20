@@ -949,6 +949,23 @@ const startWorker = async () => {
             setupEventHandlers(creatorWorker, 'CREATOR');
         }
 
+        // Start live streaming server if enabled
+        const enableLiveWorker = process.env.ENABLE_LIVE_WORKER === 'true';
+        if (enableLiveWorker) {
+            try {
+                const { createRtmpServer } = await import('./live/index.js');
+                const rtmpServer = createRtmpServer();
+                rtmpServer.run();
+                console.log('   - RTMP ingest server (port: 1935)');
+                console.log('   - Live HLS transcoding: enabled');
+            } catch (error) {
+                console.error('[STARTUP] Failed to start live server:', error);
+                console.log('   - Live streaming: DISABLED (error)');
+            }
+        } else {
+            console.log('   - Live streaming: disabled (set ENABLE_LIVE_WORKER=true to enable)');
+        }
+
         console.log(`\n${'='.repeat(80)}`);
         console.log('✅ TRANSCODING ENGINE READY');
         console.log('   - User queue worker (concurrency: 1, timeout: 10min)');
