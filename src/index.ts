@@ -93,6 +93,30 @@ const checkMemoryUsage = (): { canProcess: boolean; usagePercent: number; availa
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
+ * Wrap a promise with a timeout
+ */
+const withTimeout = async <T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    operationName: string
+): Promise<T> => {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((_, reject) => {
+                timeoutHandle = setTimeout(() => {
+                    reject(new Error(`${operationName} timed out after ${Math.round(timeoutMs / 1000)}s`));
+                }, timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+};
+
+/**
  * Retry wrapper with exponential backoff
  */
 const withRetry = async <T>(
@@ -227,6 +251,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         },
     };
     const jobStartTime = Date.now();
+    kpis.timings.queueWait = Math.max(0, jobStartTime - (job.timestamp || jobStartTime));
 
     console.log(`\n${'='.repeat(80)}`);
     console.log(`[TRANSCODE] 🎬 Starting transcoding job ${job.id}`);
@@ -366,7 +391,11 @@ const processJob = async (job: Job<TranscodeJobData>) => {
 
         // --- Phase 2: Probe video for metadata ---
         console.log(`\n[TRANSCODE] 🔍 PHASE 2: Probing video metadata`);
-        const probeData = await ffmpegService.probe(inputPath);
+        const probeData = await withTimeout(
+            ffmpegService.probe(inputPath),
+            FFMPEG_TIMEOUT_MS,
+            'ffprobe'
+        );
         const duration = probeData.format.duration || 0;
         const videoStream = probeData.streams.find(s => s.codec_type === 'video');
 
@@ -517,7 +546,8 @@ const processJob = async (job: Job<TranscodeJobData>) => {
 
                     // Throttled update to Redis
                     job.updateProgress(overallPercent).catch(() => { });
-                }
+                },
+                FFMPEG_TIMEOUT_MS
             );
 
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -568,7 +598,11 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             const timestamp = thumbnailTimestamps[i];
 
             console.log(`[TRANSCODE] 🖼️ Generating thumbnail ${i + 1}/3 at ${timestamp.toFixed(1)}s`);
-            await ffmpegService.generateThumbnail(inputPath, thumbnailPath, timestamp);
+            await withTimeout(
+                ffmpegService.generateThumbnail(inputPath, thumbnailPath, timestamp, FFMPEG_TIMEOUT_MS),
+                FFMPEG_TIMEOUT_MS,
+                `thumbnail generation ${i + 1}`
+            );
             thumbnailPaths.push(thumbnailPath);
         }
 
@@ -720,18 +754,9 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         console.log(`[TRANSCODE] ✅ Video status updated to 'completed'`);
         console.log(`[TRANSCODE] 🎉 Job ${job.id} completed successfully!`);
 
-        // Remove job from Redis after DB confirmation - status is tracked in MongoDB
-        // Wrapped in try-catch since job might already be removed by BullMQ's removeOnComplete
-        try {
-            console.log(`[TRANSCODE] 🗑️ Removing completed job from Redis...`);
-            await job.remove();
-            console.log(`[TRANSCODE] ✅ Job removed from Redis`);
-        } catch (removeError) {
-            // Not critical - BullMQ's removeOnComplete will handle it
-            console.log(`[TRANSCODE] ⚠️ Job already removed from Redis (expected behavior)`);
-        }
+        // Job cleanup policy is managed by queue producer defaults:
+        // removeOnComplete/removeOnFail in video-manch-backend/src/services/queueService.ts
 
-        activeJobs--;
         return { success: true, masterPlaylistUrl: masterPlaylistKey, outputs: uploadedOutputs };
     } catch (error: any) {
         // console.error(`\n[TRANSCODE] ❌ Job ${job.id} FAILED`);
@@ -739,27 +764,27 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         // console.error(`[TRANSCODE] 📋 Stack trace:`, error.stack);
 
         // console.log(`[TRANSCODE] 💾 Updating video status to 'failed'...`);
-        await Video.findOneAndUpdate(
-            { videoId },
-            {
-                status: 'failed',
-                'transcoding.error': error.message || 'Unknown transcoding error',
-            }
-        );
+        try {
+
+            await Video.findOneAndUpdate(
+                { videoId },
+                {
+                    status: 'failed',
+                    'transcoding.error': error.message || 'Unknown transcoding error',
+                }
+            );
+        } catch (dbError) {
+            console.error(`[TRANSCODE] ⚠️ Failed to update video status to 'failed' in DB:`, dbError);
+        }
         console.log(`[TRANSCODE] ✅ Video status updated to 'failed'`);
 
-        // Remove failed job from Redis after DB confirmation
-        try {
-            await job.remove();
-            console.log(`[TRANSCODE] 🗑️ Failed job removed from Redis`);
-        } catch (removeError) {
-            // Not critical - BullMQ's removeOnFail will handle it
-            console.log(`[TRANSCODE] ⚠️ Job already removed from Redis`);
-        }
+        // Job cleanup policy is managed by queue producer defaults:
+        // removeOnComplete/removeOnFail in video-manch-backend/src/services/queueService.ts
 
-        activeJobs--;
         throw error;
     } finally {
+        activeJobs--;
+
         // Always clean up temp files
         // console.log(`[TRANSCODE] 🧹 Cleaning up temp directory: ${tempDir}`);
         try {
@@ -953,10 +978,18 @@ const startWorker = async () => {
         const enableLiveWorker = process.env.ENABLE_LIVE_WORKER === 'true';
         if (enableLiveWorker) {
             try {
-                const { createRtmpServer } = await import('./live/index.js');
+                const { createRtmpServer, createBrowserStreamServer } = await import('./live/index.js');
+
+                // Start RTMP server for OBS/external streaming software
                 const rtmpServer = createRtmpServer();
                 rtmpServer.run();
                 console.log('   - RTMP ingest server (port: 1935)');
+
+                // Start WebSocket server for browser-based streaming
+                const browserWsPort = parseInt(process.env.BROWSER_STREAM_PORT || '8080', 10);
+                createBrowserStreamServer(browserWsPort);
+                console.log(`   - Browser stream WebSocket server (port: ${browserWsPort})`);
+
                 console.log('   - Live HLS transcoding: enabled');
             } catch (error) {
                 console.error('[STARTUP] Failed to start live server:', error);

@@ -5,3 +5,4 @@ export { SegmentWatcher } from './segmentWatcher.js';
 export type { SegmentWatcherOptions } from './segmentWatcher.js';
 export { VODRecorder } from './vodRecorder.js';
 export type { VODRecorderOptions } from './vodRecorder.js';
+export { createBrowserStreamServer, getActiveBrowserSessionsCount } from './browserStreamServer.js';

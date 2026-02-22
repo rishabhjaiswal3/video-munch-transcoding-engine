@@ -219,15 +219,20 @@ export const ffmpegService = {
     generateThumbnail(
         inputPath: string,
         outputPath: string,
-        timestampSeconds: number = 2
+        timestampSeconds: number = 2,
+        timeoutMs: number = DEFAULT_FFMPEG_TIMEOUT_MS
     ): Promise<void> {
         console.log(`[FFMPEG] 🖼️ Generating thumbnail`);
         console.log(`[FFMPEG] 💾 Input: ${inputPath}`);
         console.log(`[FFMPEG] 💾 Output: ${outputPath}`);
         console.log(`[FFMPEG] ⏱️ Timestamp: ${timestampSeconds}s`);
+        console.log(`[FFMPEG] ⏱️ Timeout: ${Math.round(timeoutMs / 60000)} minutes`);
 
         return new Promise((resolve, reject) => {
-            ffmpeg(inputPath)
+            let timeoutHandle: NodeJS.Timeout | null = null;
+            let isCompleted = false;
+
+            const command = ffmpeg(inputPath)
                 .screenshots({
                     count: 1,
                     folder: path.dirname(outputPath),
@@ -236,13 +241,25 @@ export const ffmpegService = {
                     size: '1280x720',
                 })
                 .on('end', () => {
+                    isCompleted = true;
+                    if (timeoutHandle) clearTimeout(timeoutHandle);
                     console.log(`[FFMPEG] ✅ Thumbnail generated`);
                     resolve();
                 })
                 .on('error', (err) => {
+                    isCompleted = true;
+                    if (timeoutHandle) clearTimeout(timeoutHandle);
                     console.error(`[FFMPEG] ❌ Thumbnail generation failed:`, err.message);
                     reject(err);
                 });
+
+            timeoutHandle = setTimeout(() => {
+                if (!isCompleted) {
+                    console.error(`[FFMPEG] ⏰ Thumbnail generation timeout. Killing process...`);
+                    command.kill('SIGKILL');
+                    reject(new Error(`Thumbnail generation timed out after ${Math.round(timeoutMs / 60000)} minutes.`));
+                }
+            }, timeoutMs);
         });
     },
 };
