@@ -7,6 +7,12 @@ import { LiveTranscoder } from './liveTranscoder.js';
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
 const INTERNAL_WEBHOOK_SECRET = process.env.INTERNAL_WEBHOOK_SECRET || 'internal-secret';
 
+const maskSecret = (value: string): string => {
+  if (!value) return '<empty>';
+  if (value.length <= 12) return `${value.slice(0, 4)}...${value.slice(-2)}`;
+  return `${value.slice(0, 8)}...${value.slice(-6)}`;
+};
+
 interface BrowserStreamSession {
   streamId: string;
   userId: string;
@@ -33,6 +39,13 @@ async function validateStreamKey(streamId: string, streamKey: string): Promise<{
   recordingEnabled?: boolean;
 }> {
   try {
+    console.log('[BROWSER_STREAM] Validating stream key', {
+      streamId,
+      streamKeyFingerprint: maskSecret(streamKey),
+      streamKeyLength: streamKey.length,
+      backendUrl: BACKEND_URL,
+    });
+
     const response = await axios.post(
       `${BACKEND_URL}/live/ingest/validate`,
       { streamKey },
@@ -45,6 +58,14 @@ async function validateStreamKey(streamId: string, streamKey: string): Promise<{
       }
     );
 
+    console.log('[BROWSER_STREAM] Validation response received', {
+      status: response.status,
+      success: response.data?.success,
+      validatedStreamId: response.data?.data?.streamId,
+      userId: response.data?.data?.userId,
+      userType: response.data?.data?.userType,
+    });
+
     if (response.data.success && response.data.data.streamId === streamId) {
       const data = response.data.data;
       return {
@@ -56,9 +77,26 @@ async function validateStreamKey(streamId: string, streamKey: string): Promise<{
       };
     }
 
+    if (response.data?.success && response.data?.data?.streamId !== streamId) {
+      console.error('[BROWSER_STREAM] Validation failed: streamId mismatch', {
+        requestedStreamId: streamId,
+        validatedStreamId: response.data?.data?.streamId,
+      });
+    }
+
     return { valid: false };
   } catch (error: any) {
-    console.error('[BROWSER_STREAM] Validation failed:', error.message);
+    const status = error?.response?.status;
+    const responseBody = error?.response?.data;
+    console.error('[BROWSER_STREAM] Validation failed', {
+      message: error?.message,
+      code: error?.code,
+      status,
+      backendUrl: BACKEND_URL,
+      streamId,
+      streamKeyFingerprint: maskSecret(streamKey),
+      responseBody,
+    });
     return { valid: false };
   }
 }
@@ -206,6 +244,7 @@ export function createBrowserStreamServer(port: number): WebSocketServer {
   const wss = new WebSocketServer({ port });
 
   console.log(`[BROWSER_STREAM] WebSocket server listening on port ${port}`);
+  console.log(`[BROWSER_STREAM] Backend URL: ${BACKEND_URL}`);
 
   wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
     const url = new URL(req.url || '', `http://localhost:${port}`);
@@ -227,7 +266,11 @@ export function createBrowserStreamServer(port: number): WebSocketServer {
       return;
     }
 
-    console.log(`[BROWSER_STREAM] New connection for stream ${streamId}`);
+    console.log(`[BROWSER_STREAM] New connection for stream ${streamId}`, {
+      streamKeyFingerprint: maskSecret(streamKey),
+      streamKeyLength: streamKey.length,
+      remoteAddress: req.socket?.remoteAddress,
+    });
 
     // Validate credentials
     const validation = await validateStreamKey(streamId, streamKey);
