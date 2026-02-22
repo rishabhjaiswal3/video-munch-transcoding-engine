@@ -30,7 +30,7 @@ export class VODRecorder {
       process.env.LIVE_SEGMENTS_DIR || '/tmp/live-segments',
       options.streamId
     );
-    this.apiUrl = process.env.API_URL || 'http://localhost:3000';
+    this.apiUrl = process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000';
   }
 
   /**
