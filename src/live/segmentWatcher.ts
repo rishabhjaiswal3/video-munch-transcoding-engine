@@ -53,18 +53,18 @@ export class SegmentWatcher {
       ignored: /(^|[\/\\])\../, // Ignore hidden files
     });
 
-    this.watcher.on('add', async (filePath) => {
+    this.watcher.on('add', async (filePath: string) => {
       await this.handleNewFile(filePath);
     });
 
-    this.watcher.on('change', async (filePath) => {
+    this.watcher.on('change', async (filePath: string) => {
       // Handle playlist updates
       if (filePath.endsWith('.m3u8')) {
         await this.handlePlaylistUpdate(filePath);
       }
     });
 
-    this.watcher.on('error', (error) => {
+    this.watcher.on('error', (error: Error) => {
       console.error(`[SEGMENT_WATCHER] Error:`, error);
     });
 
