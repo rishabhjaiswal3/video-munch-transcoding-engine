@@ -4,6 +4,7 @@ import path from 'path';
 import axios from 'axios';
 import { r2Service } from '../services/r2Service.js';
 import { getRedisConnection } from '../config/redis.js';
+import { getBackendBaseUrl } from '../utils/backendUrl.js';
 
 export interface VODRecorderOptions {
   streamId: string;
@@ -30,7 +31,7 @@ export class VODRecorder {
       process.env.LIVE_SEGMENTS_DIR || '/tmp/live-segments',
       options.streamId
     );
-    this.apiUrl = process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000';
+    this.apiUrl = getBackendBaseUrl();
   }
 
   /**

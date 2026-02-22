@@ -3,6 +3,7 @@ import axios from 'axios';
 import { LiveTranscoder } from './liveTranscoder.js';
 import { VODRecorder } from './vodRecorder.js';
 import { getRedisConnection } from '../config/redis.js';
+import { getBackendBaseUrl } from '../utils/backendUrl.js';
 
 export interface StreamSession {
   streamId: string;
@@ -21,7 +22,7 @@ export interface StreamSession {
 const activeSessions = new Map<string, StreamSession>();
 
 // Backend API URL for validation
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+const BACKEND_URL = getBackendBaseUrl();
 const INTERNAL_WEBHOOK_SECRET = process.env.INTERNAL_WEBHOOK_SECRET || 'internal-secret';
 
 /**

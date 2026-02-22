@@ -3,8 +3,9 @@ import { IncomingMessage } from 'http';
 import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import axios from 'axios';
 import { LiveTranscoder } from './liveTranscoder.js';
+import { getBackendBaseUrl } from '../utils/backendUrl.js';
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+const BACKEND_URL = getBackendBaseUrl();
 const INTERNAL_WEBHOOK_SECRET = process.env.INTERNAL_WEBHOOK_SECRET || 'internal-secret';
 
 const maskSecret = (value: string): string => {
