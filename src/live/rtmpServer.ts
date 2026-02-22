@@ -126,9 +126,6 @@ export function createRtmpServer(): NodeMediaServer {
       allow_origin: '*',
       mediaroot: process.env.LIVE_SEGMENTS_DIR || '/tmp/live-segments',
     },
-    trans: {
-      ffmpeg: process.env.FFMPEG_PATH || '/usr/bin/ffmpeg',
-    },
   };
 
   const nms = new NodeMediaServer(config);
