@@ -934,8 +934,8 @@ const startWorker = async () => {
             }
         );
 
-        // Only start creator worker if explicitly enabled (saves Redis calls)
-        const enableCreatorWorker = process.env.ENABLE_CREATOR_WORKER === 'true';
+        // Start creator worker by default; allow opt-out with ENABLE_CREATOR_WORKER=false
+        const enableCreatorWorker = (process.env.ENABLE_CREATOR_WORKER || 'true').toLowerCase() !== 'false';
         if (enableCreatorWorker) {
             creatorWorker = new Worker<TranscodeJobData>(
                 'creator-transcode-queue',
@@ -947,7 +947,7 @@ const startWorker = async () => {
                 }
             );
         } else {
-            console.log('[STARTUP] Creator worker disabled (set ENABLE_CREATOR_WORKER=true to enable)');
+            console.log('[STARTUP] Creator worker disabled (set ENABLE_CREATOR_WORKER=true or unset it to enable)');
         }
 
         // Event handlers
