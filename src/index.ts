@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Worker, Job } from 'bullmq';
-import { getRedisConfig, disconnectRedis } from './config/redis.js';
+import { getRedisConfig, disconnectRedis, getRedisConnection } from './config/redis.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { Video } from './models/Video.js';
 import { TranscodeJobData } from './types/index.js';
@@ -10,6 +10,7 @@ import { ffmpegService, QualityPreset } from './services/ffmpegService.js';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
 
 // ============================================================================
@@ -29,6 +30,218 @@ const PROGRESS_UPDATE_INTERVAL_MS = 2000; // Max 1 update per 2 seconds
 
 // FFmpeg timeout (prevent hanging on corrupted files)
 const FFMPEG_TIMEOUT_MS = 60 * 60 * 1000; // 60 minutes max per quality
+
+// Instance metadata (useful on Railway multi-replica deployments)
+const INSTANCE_ID =
+    process.env.RAILWAY_REPLICA_ID ||
+    process.env.RAILWAY_PRIVATE_DOMAIN ||
+    process.env.RAILWAY_DEPLOYMENT_ID ||
+    process.env.HOSTNAME ||
+    `pid-${process.pid}`;
+
+const parsePositiveIntEnv = (name: string): number | null => {
+    const raw = process.env[name];
+    if (!raw) return null;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+};
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const detectAvailableCpu = (): number => {
+    const maybeAvailableParallelism = (os as any).availableParallelism;
+    if (typeof maybeAvailableParallelism === 'function') {
+        const value = maybeAvailableParallelism();
+        if (Number.isFinite(value) && value > 0) return Math.floor(value);
+    }
+
+    const value = os.cpus()?.length || 1;
+    return Math.max(1, Math.floor(value));
+};
+
+const computeConcurrencyPlan = (enableCreatorWorker: boolean) => {
+    const availableCpu = detectAvailableCpu();
+    const cpuTarget = clamp(Number.parseFloat(process.env.CPU_UTILIZATION_TARGET || '0.8') || 0.8, 0.2, 1);
+    const reservedCpu = Math.max(0, parsePositiveIntEnv('RESERVED_CPU_CORES') || 1);
+    const globalOverride = parsePositiveIntEnv('WORKER_CONCURRENCY');
+    const userOverride = parsePositiveIntEnv('USER_WORKER_CONCURRENCY');
+    const creatorOverride = parsePositiveIntEnv('CREATOR_WORKER_CONCURRENCY');
+
+    const autoBudget = Math.max(1, Math.floor(availableCpu * cpuTarget) - reservedCpu);
+
+    if (!enableCreatorWorker) {
+        const userConcurrency = userOverride || globalOverride || autoBudget;
+        return {
+            availableCpu,
+            cpuTarget,
+            reservedCpu,
+            autoBudget,
+            userConcurrency: Math.max(1, userConcurrency),
+            creatorConcurrency: 0,
+            totalConcurrency: Math.max(1, userConcurrency),
+        };
+    }
+
+    if (userOverride || creatorOverride || globalOverride) {
+        const userConcurrency = userOverride || globalOverride || 1;
+        const creatorConcurrency = creatorOverride || globalOverride || 1;
+        return {
+            availableCpu,
+            cpuTarget,
+            reservedCpu,
+            autoBudget,
+            userConcurrency: Math.max(1, userConcurrency),
+            creatorConcurrency: Math.max(1, creatorConcurrency),
+            totalConcurrency: Math.max(1, userConcurrency) + Math.max(1, creatorConcurrency),
+        };
+    }
+
+    // Auto split: favor user queue slightly when both are enabled.
+    const userConcurrency = Math.max(1, Math.ceil(autoBudget * 0.65));
+    const creatorConcurrency = Math.max(1, Math.floor(autoBudget * 0.35));
+    return {
+        availableCpu,
+        cpuTarget,
+        reservedCpu,
+        autoBudget,
+        userConcurrency,
+        creatorConcurrency,
+        totalConcurrency: userConcurrency + creatorConcurrency,
+    };
+};
+
+class CpuSlotTracker {
+    private available: number[] = [];
+
+    constructor(size: number) {
+        this.reset(size);
+    }
+
+    reset(size: number) {
+        const safeSize = Math.max(1, Math.floor(size));
+        this.available = Array.from({ length: safeSize }, (_, idx) => idx + 1);
+    }
+
+    acquire(): number | null {
+        if (this.available.length === 0) return null;
+        return this.available.shift() || null;
+    }
+
+    release(slot: number | null) {
+        if (!slot) return;
+        if (!this.available.includes(slot)) {
+            this.available.push(slot);
+            this.available.sort((a, b) => a - b);
+        }
+    }
+}
+
+const cpuSlotTracker = new CpuSlotTracker(1);
+const GLOBAL_SEMAPHORE_KEY = process.env.GLOBAL_TRANSCODE_SEMAPHORE_KEY || 'videomanch:transcode:global:slots';
+const GLOBAL_SLOT_LEASE_MS = clamp(parsePositiveIntEnv('GLOBAL_SLOT_LEASE_MS') || 180000, 30000, 15 * 60 * 1000);
+const GLOBAL_SLOT_WAIT_TIMEOUT_MS = clamp(parsePositiveIntEnv('GLOBAL_SLOT_WAIT_TIMEOUT_MS') || 5 * 60 * 1000, 30000, 30 * 60 * 1000);
+const GLOBAL_SLOT_WAIT_POLL_MS = clamp(parsePositiveIntEnv('GLOBAL_SLOT_WAIT_POLL_MS') || 2000, 500, 15000);
+
+class GlobalJobLimiter {
+    private readonly maxSlots: number | null;
+
+    constructor(maxSlots: number | null) {
+        this.maxSlots = maxSlots && maxSlots > 0 ? Math.floor(maxSlots) : null;
+    }
+
+    isEnabled(): boolean {
+        return this.maxSlots !== null;
+    }
+
+    getConfiguredMaxSlots(): number | null {
+        return this.maxSlots;
+    }
+
+    getLeaseMs(): number {
+        return GLOBAL_SLOT_LEASE_MS;
+    }
+
+    async acquire(jobCtx: string): Promise<string | null> {
+        if (!this.maxSlots) return null;
+        const redis = getRedisConnection();
+        const token = `${INSTANCE_ID}:${randomUUID()}`;
+        const deadline = Date.now() + GLOBAL_SLOT_WAIT_TIMEOUT_MS;
+
+        while (Date.now() < deadline) {
+            const acquired = await redis.eval(
+                `
+                local key = KEYS[1]
+                local token = ARGV[1]
+                local now = tonumber(ARGV[2])
+                local leaseMs = tonumber(ARGV[3])
+                local limit = tonumber(ARGV[4])
+                redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+                local used = redis.call('ZCARD', key)
+                if used < limit then
+                    redis.call('ZADD', key, now + leaseMs, token)
+                    redis.call('PEXPIRE', key, leaseMs * 2)
+                    return 1
+                end
+                return 0
+                `,
+                1,
+                GLOBAL_SEMAPHORE_KEY,
+                token,
+                Date.now(),
+                GLOBAL_SLOT_LEASE_MS,
+                this.maxSlots
+            );
+
+            if (Number(acquired) === 1) {
+                const activeSlots = await redis.zcard(GLOBAL_SEMAPHORE_KEY);
+                console.log(`${jobCtx} [GLOBAL] slot acquired (${activeSlots}/${this.maxSlots})`);
+                return token;
+            }
+
+            await sleep(GLOBAL_SLOT_WAIT_POLL_MS);
+        }
+
+        return null;
+    }
+
+    async renew(token: string): Promise<boolean> {
+        if (!this.maxSlots) return true;
+        const redis = getRedisConnection();
+        const renewed = await redis.eval(
+            `
+            local key = KEYS[1]
+            local token = ARGV[1]
+            local now = tonumber(ARGV[2])
+            local leaseMs = tonumber(ARGV[3])
+            local exists = redis.call('ZSCORE', key, token)
+            if exists then
+                redis.call('ZADD', key, now + leaseMs, token)
+                redis.call('PEXPIRE', key, leaseMs * 2)
+                return 1
+            end
+            return 0
+            `,
+            1,
+            GLOBAL_SEMAPHORE_KEY,
+            token,
+            Date.now(),
+            GLOBAL_SLOT_LEASE_MS
+        );
+        return Number(renewed) === 1;
+    }
+
+    async release(jobCtx: string, token: string | null) {
+        if (!this.maxSlots || !token) return;
+        try {
+            const redis = getRedisConnection();
+            await redis.zrem(GLOBAL_SEMAPHORE_KEY, token);
+            const activeSlots = await redis.zcard(GLOBAL_SEMAPHORE_KEY);
+            console.log(`${jobCtx} [GLOBAL] slot released (${activeSlots}/${this.maxSlots})`);
+        } catch (error) {
+            console.error(`${jobCtx} [GLOBAL] failed to release slot`, error);
+        }
+    }
+}
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -221,12 +434,27 @@ const parseFps = (fpsString: string | undefined): number => {
 // Track workers for graceful shutdown
 let userWorker: Worker<TranscodeJobData> | null = null;
 let creatorWorker: Worker<TranscodeJobData> | null = null;
+let globalJobLimiter: GlobalJobLimiter | null = null;
 let isShuttingDown = false;
 let activeJobs = 0;
 
 const processJob = async (job: Job<TranscodeJobData>) => {
     const { videoId, userId, userType, r2Key, qualities } = job.data;
     const tempDir = path.join(TEMP_BASE_DIR, videoId);
+    const cpuSlot = cpuSlotTracker.acquire();
+    const cpuLabel = cpuSlot ? `cpu-${cpuSlot}` : 'cpu-unassigned';
+    const jobCtx = `[INSTANCE:${INSTANCE_ID}][${cpuLabel}][QUEUE:${job.queueName}][VIDEO:${videoId}]`;
+    const ctxLog = (message: string) => console.log(`${jobCtx} ${message}`);
+    const ctxWarn = (message: string) => console.warn(`${jobCtx} ${message}`);
+    const ctxError = (message: string, error?: unknown) => {
+        if (error) {
+            console.error(`${jobCtx} ${message}`, error);
+        } else {
+            console.error(`${jobCtx} ${message}`);
+        }
+    };
+    let globalSlotToken: string | null = null;
+    let globalRenewTimer: NodeJS.Timeout | null = null;
 
     // Track active jobs for graceful shutdown
     activeJobs++;
@@ -254,14 +482,36 @@ const processJob = async (job: Job<TranscodeJobData>) => {
     kpis.timings.queueWait = Math.max(0, jobStartTime - (job.timestamp || jobStartTime));
 
     console.log(`\n${'='.repeat(80)}`);
-    console.log(`[TRANSCODE] 🎬 Starting transcoding job ${job.id}`);
-    console.log(`[TRANSCODE] 🎥 Video ID: ${videoId}`);
-    console.log(`[TRANSCODE] 👤 User: ${userId} (${userType})`);
-    console.log(`[TRANSCODE] 🎯 Target qualities: ${qualities.join(', ')}`);
-    console.log(`[TRANSCODE] 📁 Temp directory: ${tempDir}`);
+    ctxLog(`🎬 Starting transcoding job ${job.id}`);
+    ctxLog(`👤 User: ${userId} (${userType})`);
+    ctxLog(`🎯 Target qualities: ${qualities.join(', ')}`);
+    ctxLog(`📁 Temp directory: ${tempDir}`);
     console.log(`${'='.repeat(80)}\n`);
 
     try {
+        if (globalJobLimiter?.isEnabled()) {
+            globalSlotToken = await globalJobLimiter.acquire(jobCtx);
+            if (!globalSlotToken) {
+                throw new Error(
+                    `Global transcode capacity is full. Waited ${Math.round(GLOBAL_SLOT_WAIT_TIMEOUT_MS / 1000)}s for a slot.`
+                );
+            }
+            const renewEveryMs = Math.max(10000, Math.floor(globalJobLimiter.getLeaseMs() / 3));
+            globalRenewTimer = setInterval(() => {
+                if (!globalSlotToken || !globalJobLimiter) return;
+                globalJobLimiter.renew(globalSlotToken)
+                    .then(renewed => {
+                        if (!renewed) {
+                            ctxWarn('global slot lease was lost; continuing current job and relying on local capacity guard');
+                        }
+                    })
+                    .catch(err => {
+                        ctxWarn(`failed to renew global slot lease: ${err?.message || 'unknown error'}`);
+                    });
+            }, renewEveryMs);
+            globalRenewTimer.unref();
+        }
+
         // --- Pre-flight checks ---
         console.log(`[TRANSCODE] 🔍 Running pre-flight checks...`);
 
@@ -495,7 +745,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             // Check memory before each quality transcoding
             const memCheckBeforeQuality = checkMemoryUsage();
             if (!memCheckBeforeQuality.canProcess) {
-                console.warn(`[TRANSCODE] ⚠️ Memory high (${memCheckBeforeQuality.usagePercent}%), waiting 10s before ${smartQualities[i]}...`);
+            ctxWarn(`⚠️ Memory high (${memCheckBeforeQuality.usagePercent}%), waiting 10s before ${smartQualities[i]}...`);
                 await sleep(10000);
             }
 
@@ -752,7 +1002,7 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         );
 
         console.log(`[TRANSCODE] ✅ Video status updated to 'completed'`);
-        console.log(`[TRANSCODE] 🎉 Job ${job.id} completed successfully!`);
+        ctxLog(`🎉 Job ${job.id} completed successfully!`);
 
         // Job cleanup policy is managed by queue producer defaults:
         // removeOnComplete/removeOnFail in video-manch-backend/src/services/queueService.ts
@@ -774,9 +1024,9 @@ const processJob = async (job: Job<TranscodeJobData>) => {
                 }
             );
         } catch (dbError) {
-            console.error(`[TRANSCODE] ⚠️ Failed to update video status to 'failed' in DB:`, dbError);
+            ctxError(`⚠️ Failed to update video status to 'failed' in DB`, dbError);
         }
-        console.log(`[TRANSCODE] ✅ Video status updated to 'failed'`);
+        ctxLog(`❌ Job failed; video status updated to 'failed'`);
 
         // Job cleanup policy is managed by queue producer defaults:
         // removeOnComplete/removeOnFail in video-manch-backend/src/services/queueService.ts
@@ -784,6 +1034,12 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         throw error;
     } finally {
         activeJobs--;
+        cpuSlotTracker.release(cpuSlot);
+        if (globalRenewTimer) {
+            clearInterval(globalRenewTimer);
+            globalRenewTimer = null;
+        }
+        await globalJobLimiter?.release(jobCtx, globalSlotToken);
 
         // Always clean up temp files
         // console.log(`[TRANSCODE] 🧹 Cleaning up temp directory: ${tempDir}`);
@@ -904,6 +1160,16 @@ const startWorker = async () => {
         const redisConfig = getRedisConfig();
 
         console.log('[STARTUP] Initializing workers...');
+        const enableCreatorWorker = (process.env.ENABLE_CREATOR_WORKER || 'true').toLowerCase() !== 'false';
+        const concurrencyPlan = computeConcurrencyPlan(enableCreatorWorker);
+        const replicaCountHint = parsePositiveIntEnv('REPLICA_COUNT') || parsePositiveIntEnv('RAILWAY_REPLICA_COUNT');
+        const globalMaxTranscodeJobs = parsePositiveIntEnv('GLOBAL_MAX_TRANSCODE_JOBS');
+        globalJobLimiter = new GlobalJobLimiter(globalMaxTranscodeJobs);
+        cpuSlotTracker.reset(concurrencyPlan.totalConcurrency);
+
+        if (enableCreatorWorker && concurrencyPlan.autoBudget < 2 && !parsePositiveIntEnv('WORKER_CONCURRENCY') && !parsePositiveIntEnv('USER_WORKER_CONCURRENCY') && !parsePositiveIntEnv('CREATOR_WORKER_CONCURRENCY')) {
+            console.warn(`[STARTUP] [INSTANCE:${INSTANCE_ID}] Low CPU budget detected (${concurrencyPlan.autoBudget}). Set WORKER_CONCURRENCY/USER_WORKER_CONCURRENCY/CREATOR_WORKER_CONCURRENCY for manual tuning.`);
+        }
 
         // Worker settings with stalled job recovery enabled
         // Now using Railway Redis (unlimited requests), so we can enable proper job recovery
@@ -929,20 +1195,19 @@ const startWorker = async () => {
             processJob,
             {
                 ...workerSettings,
-                concurrency: 1,  // Reduced to 1 to save memory/Redis calls
+                concurrency: concurrencyPlan.userConcurrency,
                 lockDuration: 600000, // 10 min timeout per job
             }
         );
 
         // Start creator worker by default; allow opt-out with ENABLE_CREATOR_WORKER=false
-        const enableCreatorWorker = (process.env.ENABLE_CREATOR_WORKER || 'true').toLowerCase() !== 'false';
         if (enableCreatorWorker) {
             creatorWorker = new Worker<TranscodeJobData>(
                 'creator-transcode-queue',
                 processJob,
                 {
                     ...workerSettings,
-                    concurrency: 1,
+                    concurrency: concurrencyPlan.creatorConcurrency,
                     lockDuration: 1800000, // 30 min timeout (larger files)
                 }
             );
@@ -953,15 +1218,15 @@ const startWorker = async () => {
         // Event handlers
         const setupEventHandlers = (worker: Worker, name: string) => {
             worker.on('completed', (job) => {
-                console.log(`[${name}] ✅ Job ${job.id} completed`);
+                console.log(`[${name}] [INSTANCE:${INSTANCE_ID}] ✅ Job ${job.id} completed`);
             });
 
             worker.on('failed', (job, err) => {
-                console.error(`[${name}] ❌ Job ${job?.id} failed:`, err.message);
+                console.error(`[${name}] [INSTANCE:${INSTANCE_ID}] ❌ Job ${job?.id} failed:`, err.message);
             });
 
             worker.on('error', (err) => {
-                console.error(`[${name}] ⚠️ Worker error:`, err);
+                console.error(`[${name}] [INSTANCE:${INSTANCE_ID}] ⚠️ Worker error:`, err);
             });
 
             worker.on('stalled', (jobId) => {
@@ -976,10 +1241,23 @@ const startWorker = async () => {
 
 
         console.log(`\n${'='.repeat(80)}`);
-        console.log('✅ TRANSCODING ENGINE READY');
-        console.log('   - User queue worker (concurrency: 1, timeout: 10min)');
+        console.log(`✅ TRANSCODING ENGINE READY [INSTANCE:${INSTANCE_ID}]`);
+        console.log(`   - Available CPU detected: ${concurrencyPlan.availableCpu}`);
+        console.log(`   - CPU target: ${(concurrencyPlan.cpuTarget * 100).toFixed(0)}% | Reserved cores: ${concurrencyPlan.reservedCpu}`);
+        console.log(`   - Auto CPU budget: ${concurrencyPlan.autoBudget}`);
+        console.log(`   - Total concurrency slots: ${concurrencyPlan.totalConcurrency}`);
+        if (replicaCountHint) {
+            const estimatedClusterSlots = concurrencyPlan.totalConcurrency * replicaCountHint;
+            console.log(`   - Replica hint: ${replicaCountHint} (estimated cluster slots: ${estimatedClusterSlots})`);
+        }
+        if (globalJobLimiter.isEnabled()) {
+            console.log(`   - Global transcode cap (all replicas): ${globalJobLimiter.getConfiguredMaxSlots()} via Redis semaphore`);
+        } else {
+            console.log('   - Global transcode cap: disabled (set GLOBAL_MAX_TRANSCODE_JOBS to enable)');
+        }
+        console.log(`   - User queue worker (concurrency: ${concurrencyPlan.userConcurrency}, timeout: 10min)`);
         if (creatorWorker) {
-            console.log('   - Creator queue worker (concurrency: 1, timeout: 30min)');
+            console.log(`   - Creator queue worker (concurrency: ${concurrencyPlan.creatorConcurrency}, timeout: 30min)`);
         }
         console.log('   - Stalled job recovery: enabled (checks every 2 min)');
         console.log('   - Auto-retry on restart: yes (up to 3 attempts)');
