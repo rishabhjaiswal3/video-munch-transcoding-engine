@@ -59,17 +59,18 @@ const detectAvailableCpu = (): number => {
     return Math.max(1, Math.floor(value));
 };
 
-const computeConcurrencyPlan = (enableCreatorWorker: boolean) => {
+const computeConcurrencyPlan = (enableCreatorWorker: boolean, enableAdWorker: boolean) => {
     const availableCpu = detectAvailableCpu();
     const cpuTarget = clamp(Number.parseFloat(process.env.CPU_UTILIZATION_TARGET || '0.8') || 0.8, 0.2, 1);
     const reservedCpu = Math.max(0, parsePositiveIntEnv('RESERVED_CPU_CORES') || 1);
     const globalOverride = parsePositiveIntEnv('WORKER_CONCURRENCY');
     const userOverride = parsePositiveIntEnv('USER_WORKER_CONCURRENCY');
     const creatorOverride = parsePositiveIntEnv('CREATOR_WORKER_CONCURRENCY');
+    const adOverride = parsePositiveIntEnv('AD_WORKER_CONCURRENCY');
 
     const autoBudget = Math.max(1, Math.floor(availableCpu * cpuTarget) - reservedCpu);
 
-    if (!enableCreatorWorker) {
+    if (!enableCreatorWorker && !enableAdWorker) {
         const userConcurrency = userOverride || globalOverride || autoBudget;
         return {
             availableCpu,
@@ -78,27 +79,32 @@ const computeConcurrencyPlan = (enableCreatorWorker: boolean) => {
             autoBudget,
             userConcurrency: Math.max(1, userConcurrency),
             creatorConcurrency: 0,
+            adConcurrency: 0,
             totalConcurrency: Math.max(1, userConcurrency),
         };
     }
 
-    if (userOverride || creatorOverride || globalOverride) {
+    if (userOverride || creatorOverride || adOverride || globalOverride) {
         const userConcurrency = userOverride || globalOverride || 1;
-        const creatorConcurrency = creatorOverride || globalOverride || 1;
+        const creatorConcurrency = enableCreatorWorker ? (creatorOverride || globalOverride || 1) : 0;
+        const adConcurrency = enableAdWorker ? (adOverride || globalOverride || 1) : 0;
+        const total = Math.max(1, userConcurrency) + Math.max(0, creatorConcurrency) + Math.max(0, adConcurrency);
         return {
             availableCpu,
             cpuTarget,
             reservedCpu,
             autoBudget,
             userConcurrency: Math.max(1, userConcurrency),
-            creatorConcurrency: Math.max(1, creatorConcurrency),
-            totalConcurrency: Math.max(1, userConcurrency) + Math.max(1, creatorConcurrency),
+            creatorConcurrency: Math.max(0, creatorConcurrency),
+            adConcurrency: Math.max(0, adConcurrency),
+            totalConcurrency: total,
         };
     }
 
-    // Auto split: favor user queue slightly when both are enabled.
-    const userConcurrency = Math.max(1, Math.ceil(autoBudget * 0.65));
-    const creatorConcurrency = Math.max(1, Math.floor(autoBudget * 0.35));
+    // Auto split: user 55%, creator 35%, ad 10%
+    const userConcurrency = Math.max(1, Math.ceil(autoBudget * (enableCreatorWorker ? 0.55 : 0.65)));
+    const creatorConcurrency = enableCreatorWorker ? Math.max(1, Math.floor(autoBudget * 0.35)) : 0;
+    const adConcurrency = enableAdWorker ? Math.max(1, Math.floor(autoBudget * 0.10)) : 0;
     return {
         availableCpu,
         cpuTarget,
@@ -106,7 +112,8 @@ const computeConcurrencyPlan = (enableCreatorWorker: boolean) => {
         autoBudget,
         userConcurrency,
         creatorConcurrency,
-        totalConcurrency: userConcurrency + creatorConcurrency,
+        adConcurrency,
+        totalConcurrency: userConcurrency + creatorConcurrency + adConcurrency,
     };
 };
 
@@ -434,6 +441,7 @@ const parseFps = (fpsString: string | undefined): number => {
 // Track workers for graceful shutdown
 let userWorker: Worker<TranscodeJobData> | null = null;
 let creatorWorker: Worker<TranscodeJobData> | null = null;
+let adWorker: Worker<TranscodeJobData> | null = null;
 let globalJobLimiter: GlobalJobLimiter | null = null;
 let isShuttingDown = false;
 let activeJobs = 0;
@@ -590,14 +598,16 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         }
 
         console.log(`[TRANSCODE] 💾 Updating video status to 'processing'...`);
-        await Video.findOneAndUpdate(
-            { videoId },
-            {
-                status: 'processing',
-                'transcoding.startedAt': new Date(),
-                'transcoding.progress': 0,
-            }
-        );
+        if (!job.data.callbackUrl) {
+            await Video.findOneAndUpdate(
+                { videoId },
+                {
+                    status: 'processing',
+                    'transcoding.startedAt': new Date(),
+                    'transcoding.progress': 0,
+                }
+            );
+        }
         console.log(`[TRANSCODE] ✅ Video status updated to 'processing'`);
 
         // Weighted progress: download=10, each quality=20, thumbnail=5, upload=5
@@ -676,20 +686,23 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         console.log(`[TRANSCODE] 🎞️ Codec: ${originalCodec}, Bitrate: ${(originalBitrate / 1000).toFixed(0)}k, FPS: ${originalFps.toFixed(1)}`);
         console.log(`[TRANSCODE] ✅ Probe complete`);
 
-        // Store original metadata
-        await Video.findOneAndUpdate(
-            { videoId },
-            {
-                originalMetadata: {
-                    width: originalWidth,
-                    height: originalHeight,
-                    duration,
-                    codec: originalCodec,
-                    bitrate: originalBitrate,
-                    fps: originalFps,
-                },
-            }
-        );
+        // Store original metadata (skip for callback jobs — they don't have a Video record here)
+        if (!job.data.callbackUrl) {
+            await Video.findOneAndUpdate(
+                { videoId },
+                {
+                    originalMetadata: {
+                        width: originalWidth,
+                        height: originalHeight,
+                        duration,
+                        codec: originalCodec,
+                        bitrate: originalBitrate,
+                        fps: originalFps,
+                    },
+                }
+            );
+        }
+        const probeResult = { width: originalWidth, height: originalHeight, duration, codec: originalCodec, bitrate: originalBitrate };
 
         // Smart quality selection - don't upscale, but include source quality
         const smartQualities = qualities.filter(quality => {
@@ -985,21 +998,39 @@ const processJob = async (job: Job<TranscodeJobData>) => {
         console.log(`[TRANSCODE] 💾 Saving to DB - thumbnail: ${thumbnailUrls[0]}`);
         console.log(`[TRANSCODE] 💾 Saving to DB - outputs:`, JSON.stringify(uploadedOutputs, null, 2));
 
-        await Video.findOneAndUpdate(
-            { videoId },
-            {
-                status: 'completed',
-                transcodingCompleted: true,  // Mark transcoding as complete
-                masterPlaylistUrl: masterPlaylistKey,  // Store only path, frontend constructs full URL
-                outputs: uploadedOutputs,  // Array of quality variants
-                thumbnail: thumbnailUrls[0],  // Primary thumbnail
-                thumbnails: thumbnailUrls,    // All thumbnails
+        const { callbackUrl } = job.data;
+
+        if (callbackUrl) {
+            // Ad jobs (or any job with callbackUrl): POST results back instead of writing to Video collection
+            const callbackOk = await postCallback(callbackUrl, {
+                masterPlaylistUrl: masterPlaylistKey,
+                outputs: uploadedOutputs,
+                thumbnail: thumbnailUrls[0],
+                thumbnails: thumbnailUrls,
+                originalMetadata: probeResult,
                 duration: Math.round(duration),
-                kpis,  // Performance metrics
-                'transcoding.progress': 100,
-                'transcoding.completedAt': new Date(),
+            }, jobCtx);
+            if (!callbackOk) {
+                throw new Error(`Callback to ${callbackUrl} failed after retries`);
             }
-        );
+        } else {
+            // Standard video jobs: write directly to Video collection
+            await Video.findOneAndUpdate(
+                { videoId },
+                {
+                    status: 'completed',
+                    transcodingCompleted: true,
+                    masterPlaylistUrl: masterPlaylistKey,
+                    outputs: uploadedOutputs,
+                    thumbnail: thumbnailUrls[0],
+                    thumbnails: thumbnailUrls,
+                    duration: Math.round(duration),
+                    kpis,
+                    'transcoding.progress': 100,
+                    'transcoding.completedAt': new Date(),
+                }
+            );
+        }
 
         console.log(`[TRANSCODE] ✅ Video status updated to 'completed'`);
         ctxLog(`🎉 Job ${job.id} completed successfully!`);
@@ -1015,14 +1046,20 @@ const processJob = async (job: Job<TranscodeJobData>) => {
 
         // console.log(`[TRANSCODE] 💾 Updating video status to 'failed'...`);
         try {
-
-            await Video.findOneAndUpdate(
-                { videoId },
-                {
-                    status: 'failed',
-                    'transcoding.error': error.message || 'Unknown transcoding error',
-                }
-            );
+            const { callbackUrl } = job.data;
+            if (callbackUrl) {
+                await postCallback(callbackUrl, {
+                    error: error.message || 'Unknown transcoding error',
+                }, jobCtx).catch(() => {});
+            } else {
+                await Video.findOneAndUpdate(
+                    { videoId },
+                    {
+                        status: 'failed',
+                        'transcoding.error': error.message || 'Unknown transcoding error',
+                    }
+                );
+            }
         } catch (dbError) {
             ctxError(`⚠️ Failed to update video status to 'failed' in DB`, dbError);
         }
@@ -1050,6 +1087,38 @@ const processJob = async (job: Job<TranscodeJobData>) => {
             // console.error(`[TRANSCODE] ⚠️ Failed to clean up temp directory: ${tempDir}`, cleanupError);
         }
     }
+};
+
+const postCallback = async (
+    callbackUrl: string,
+    payload: Record<string, unknown>,
+    jobCtx: string,
+): Promise<boolean> => {
+    const MAX_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            const internalSecret = process.env.INTERNAL_SECRET;
+            const resp = await fetch(callbackUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(internalSecret ? { 'X-Internal-Secret': internalSecret } : {}),
+                },
+                body: JSON.stringify(payload),
+            });
+            if (resp.ok) {
+                console.log(`${jobCtx} [CALLBACK] POST to ${callbackUrl} succeeded (attempt ${attempt})`);
+                return true;
+            }
+            console.warn(`${jobCtx} [CALLBACK] POST to ${callbackUrl} returned ${resp.status} (attempt ${attempt})`);
+        } catch (err: any) {
+            console.warn(`${jobCtx} [CALLBACK] POST to ${callbackUrl} failed (attempt ${attempt}): ${err.message}`);
+        }
+        if (attempt < MAX_RETRIES) {
+            await new Promise(r => setTimeout(r, 2000 * attempt));
+        }
+    }
+    return false;
 };
 
 const updateVideoProgress = async (videoId: string, progress: number) => {
@@ -1085,6 +1154,10 @@ const gracefulShutdown = async (signal: string) => {
             await creatorWorker.pause();
             console.log('[SHUTDOWN] Creator worker paused');
         }
+        if (adWorker) {
+            await adWorker.pause();
+            console.log('[SHUTDOWN] Ad worker paused');
+        }
     } catch (error) {
         console.error('[SHUTDOWN] Error pausing workers:', error);
     }
@@ -1114,6 +1187,10 @@ const gracefulShutdown = async (signal: string) => {
         if (creatorWorker) {
             await creatorWorker.close();
             console.log('[SHUTDOWN] Creator worker closed');
+        }
+        if (adWorker) {
+            await adWorker.close();
+            console.log('[SHUTDOWN] Ad worker closed');
         }
     } catch (error) {
         console.error('[SHUTDOWN] Error closing workers:', error);
@@ -1161,7 +1238,8 @@ const startWorker = async () => {
 
         console.log('[STARTUP] Initializing workers...');
         const enableCreatorWorker = (process.env.ENABLE_CREATOR_WORKER || 'true').toLowerCase() !== 'false';
-        const concurrencyPlan = computeConcurrencyPlan(enableCreatorWorker);
+        const enableAdWorker = (process.env.ENABLE_AD_WORKER || 'true').toLowerCase() !== 'false';
+        const concurrencyPlan = computeConcurrencyPlan(enableCreatorWorker, enableAdWorker);
         const replicaCountHint = parsePositiveIntEnv('REPLICA_COUNT') || parsePositiveIntEnv('RAILWAY_REPLICA_COUNT');
         const globalMaxTranscodeJobs = parsePositiveIntEnv('GLOBAL_MAX_TRANSCODE_JOBS');
         globalJobLimiter = new GlobalJobLimiter(globalMaxTranscodeJobs);
@@ -1215,6 +1293,21 @@ const startWorker = async () => {
             console.log('[STARTUP] Creator worker disabled (set ENABLE_CREATOR_WORKER=true or unset it to enable)');
         }
 
+        // Start ad worker for ad-transcode-queue
+        if (enableAdWorker) {
+            adWorker = new Worker<TranscodeJobData>(
+                'ad-transcode-queue',
+                processJob,
+                {
+                    ...workerSettings,
+                    concurrency: concurrencyPlan.adConcurrency,
+                    lockDuration: 300000, // 5 min timeout (ads are short, 15-30s)
+                }
+            );
+        } else {
+            console.log('[STARTUP] Ad worker disabled (set ENABLE_AD_WORKER=true or unset it to enable)');
+        }
+
         // Event handlers
         const setupEventHandlers = (worker: Worker, name: string) => {
             worker.on('completed', (job) => {
@@ -1238,6 +1331,9 @@ const startWorker = async () => {
         if (creatorWorker) {
             setupEventHandlers(creatorWorker, 'CREATOR');
         }
+        if (adWorker) {
+            setupEventHandlers(adWorker, 'AD');
+        }
 
 
         console.log(`\n${'='.repeat(80)}`);
@@ -1258,6 +1354,9 @@ const startWorker = async () => {
         console.log(`   - User queue worker (concurrency: ${concurrencyPlan.userConcurrency}, timeout: 10min)`);
         if (creatorWorker) {
             console.log(`   - Creator queue worker (concurrency: ${concurrencyPlan.creatorConcurrency}, timeout: 30min)`);
+        }
+        if (adWorker) {
+            console.log(`   - Ad queue worker (concurrency: ${concurrencyPlan.adConcurrency}, timeout: 5min)`);
         }
         console.log('   - Stalled job recovery: enabled (checks every 2 min)');
         console.log('   - Auto-retry on restart: yes (up to 3 attempts)');
