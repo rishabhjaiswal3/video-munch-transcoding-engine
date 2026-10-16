@@ -1,501 +1,200 @@
-# 🎬 Transcoding Engine
+# Video Manch Transcoding Engine
 
-**Standalone video transcoding microservice** for the I_TUBE platform.
-
-This is a dedicated, scalable transcoding worker that processes video files using FFmpeg, BullMQ queues, and Cloudflare R2 storage.
-
----
-
-## 🏗️ Architecture
+Standalone video transcoding worker for Video Manch. It pulls jobs from BullMQ, transcodes them to HLS with FFmpeg, stores the playlists and segments in Cloudflare R2, and writes status back to MongoDB.
 
 ```
-Backend API → BullMQ Queue → Transcoding Engine → R2 Storage → MongoDB
+Backend API → BullMQ (Redis) → Transcoding engine → R2 (HLS) + MongoDB
 ```
 
-The transcoding engine is **completely independent** from the backend API:
-- Runs as a separate process/service
-- Can be scaled horizontally (multiple instances)
-- Connects to the same Redis queue and MongoDB as the backend
-- Processes video transcoding jobs asynchronously
+The worker runs as its own process. It shares Redis and MongoDB with the backend and can run as more than one replica.
 
----
+## Features
 
-## ✨ Features
+- HLS adaptive bitrate output (H.264 video, AAC audio)
+- Renditions at 1080p, 720p, 480p, 360p, and 240p, without upscaling past the source
+- Master playlist plus per-quality `.m3u8` playlists and `.ts` segments
+- Three JPEG thumbnails per video
+- Separate `user-transcode-queue` and `creator-transcode-queue`
+- CPU-based concurrency, with an optional Redis cap across replicas
+- Disk, memory, and upload retries before a job is marked failed
+- Graceful shutdown on `SIGINT` and `SIGTERM`
 
-- ✅ **Multi-quality transcoding** (1080p, 720p, 480p, 360p)
-- ✅ **H.264 + AAC encoding** (web-optimized MP4)
-- ✅ **Automatic thumbnail generation**
-- ✅ **Progress tracking** with detailed logs
-- ✅ **Graceful shutdown** (waits for active jobs)
-- ✅ **Separate queues** for users vs creators
-- ✅ **Cloudflare R2 integration** for storage
-- ✅ **Comprehensive logging** with progress bars
+## Prerequisites
 
----
+- Node.js 18 or newer
+- FFmpeg with libx264 and AAC
+- Redis
+- MongoDB
+- A Cloudflare R2 account
 
-## 📋 Prerequisites
+Install FFmpeg:
 
-### Required Software:
-1. **Node.js** (v18 or higher)
-2. **FFmpeg** (with libx264 and AAC support)
-3. **Redis** (for BullMQ queue)
-4. **MongoDB** (for video metadata)
-5. **Cloudflare R2** account (for storage)
-
-### Install FFmpeg:
-
-**macOS:**
 ```bash
+# macOS
 brew install ffmpeg
-```
 
-**Ubuntu/Debian:**
-```bash
+# Ubuntu/Debian
 sudo apt update
 sudo apt install ffmpeg
 ```
 
-**Windows:**
-Download from [ffmpeg.org](https://ffmpeg.org/download.html)
+On Windows, install FFmpeg from [ffmpeg.org](https://ffmpeg.org/download.html) and make sure `ffmpeg` and `ffprobe` are on `PATH`.
 
----
+## Setup
 
-## 🚀 Installation
-
-### 1. Install Dependencies
 ```bash
-cd transcoding-engine
-yarn install
-# or
 npm install
-```
-
-### 2. Configure Environment
-```bash
 cp .env.example .env
-```
-
-Edit `.env` with your credentials:
-```env
-# MongoDB
-MONGODB_URI=mongodb+srv://<Name>:<Password>@videomanch.f6qdcu1.mongodb.net/?appName=videoManch
-
-# Redis
-REDIS_URL=redis://localhost:6379
-
-# Cloudflare R2
-R2_ACCOUNT_ID=your_account_id
-R2_ACCESS_KEY_ID=your_access_key_id
-R2_SECRET_ACCESS_KEY=your_secret_access_key
-R2_BUCKET_RAW=video-raw
-R2_BUCKET_TRANSCODED=video-transcoded
-R2_BUCKET_THUMBNAILS=video-thumbnails
-R2_PUBLIC_URL=https://your-public-url.com
-```
-
-### 3. Verify FFmpeg Installation
-```bash
 ffmpeg -version
 ffprobe -version
 ```
 
----
+Fill in `.env`. Bucket names below match `.env.example`:
 
-## 🎯 Usage
+```env
+MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/?appName=videoManch
+REDIS_URL=redis://localhost:6379
 
-### Development Mode
+R2_ACCOUNT_ID=your_account_id
+R2_ACCESS_KEY_ID=your_access_key_id
+R2_SECRET_ACCESS_KEY=your_secret_access_key
+R2_BUCKET_RAW=videos-raw-upload
+R2_BUCKET_TRANSCODED=videos-transcoded-data
+R2_BUCKET_THUMBNAILS=videos-thumbnails
+R2_PUBLIC_URL=https://your-public-url.com
+```
+
+The worker stores R2 object keys in MongoDB. The frontend builds the public URL from `R2_PUBLIC_URL`.
+
+## Run
+
 ```bash
-yarn dev
-# or
 npm run dev
 ```
 
-### Production Mode
-```bash
-# Build TypeScript
-yarn build
-
-# Run compiled code
-yarn start
-```
-
----
-
-## 📊 How It Works
-
-### 1. **Job Reception**
-- Listens to BullMQ queues: `user-transcode-queue` and `creator-transcode-queue`
-- Receives job data: `{ videoId, userId, userType, r2Key, qualities }`
-
-### 2. **Processing Pipeline**
-
-```
-Phase 1: Download → Phase 2: Probe → Phase 3: Transcode → Phase 4: Thumbnail → Phase 5: Upload → Phase 6: Finalize
-```
-
-**Phase 1: Download Original Video**
-- Downloads from R2 `video-raw` bucket
-- Saves to temp directory: `/tmp/video-transcoding/{videoId}/`
-
-**Phase 2: Probe Video Metadata**
-- Extracts duration, resolution, codec info using FFprobe
-
-**Phase 3: Transcode to Multiple Qualities**
-- For each quality (1080p, 720p, 480p, 360p):
-  - Encodes with H.264 video + AAC audio
-  - Maintains aspect ratio with padding
-  - Optimizes for web streaming (`-movflags +faststart`)
-  - Shows progress bar in logs
-
-**Phase 4: Generate Thumbnail**
-- Extracts frame at 10% of video duration
-- Creates 1280×720 JPEG thumbnail
-
-**Phase 5: Upload to R2**
-- Uploads all transcoded videos to `video-transcoded` bucket
-- Uploads thumbnail
-
-**Phase 6: Finalize**
-- Updates MongoDB with:
-  - Status: `completed`
-  - Output URLs for each quality
-  - Thumbnail URL
-  - Video duration
-
-### 3. **Progress Tracking**
-- Real-time progress updates to BullMQ (visible in backend)
-- Periodic updates to MongoDB
-- Detailed console logs with progress bars
-
----
-
-## 📈 Console Output Example
-
-```
-================================================================================
-🎬 I_TUBE TRANSCODING ENGINE
-   Standalone Video Processing Worker
-================================================================================
-
-[STARTUP] Connecting to MongoDB...
-[DATABASE] ✅ Connected to MongoDB
-[STARTUP] Connecting to Redis...
-[REDIS] ✅ Connected to Redis
-[STARTUP] Initializing workers...
-
-================================================================================
-✅ TRANSCODING ENGINE READY
-   - User queue worker (concurrency: 2, timeout: 10min)
-   - Creator queue worker (concurrency: 1, timeout: 30min)
-   - Listening for transcoding jobs...
-================================================================================
-
-================================================================================
-[TRANSCODE] 🎬 Starting transcoding job abc-123
-[TRANSCODE] 🎥 Video ID: abc-123-def-456
-[TRANSCODE] 👤 User: user123 (creator)
-[TRANSCODE] 🎯 Target qualities: 1080p, 720p, 480p, 360p
-================================================================================
-
-[TRANSCODE] 📥 PHASE 1: Downloading original video from R2
-[R2] 📥 Downloading from R2
-[R2] ✅ Download complete
-[TRANSCODE] 📊 Progress: 10% (10/85 weight units)
-
-[TRANSCODE] 🔍 PHASE 2: Probing video metadata
-[FFMPEG] 🔍 Probing video: /tmp/video-transcoding/abc-123/original.mp4
-[FFMPEG] ✅ Probe successful
-[TRANSCODE] ⏱️ Video duration: 120.50s
-[TRANSCODE] 📐 Video dimensions: 1920x1080
-
-[TRANSCODE] ⚙️ PHASE 3: Transcoding to multiple qualities
-
-[TRANSCODE] 🎞️ Transcoding quality 1/4: 1080p
-[TRANSCODE] 🔄 Starting FFmpeg encoding...
-[TRANSCODE] 🔄 1080p: [█░░░░░░░░░░░░░░░░░░░] 5% | Time: 2.3s | Overall: 11%
-[TRANSCODE] 🔄 1080p: [██░░░░░░░░░░░░░░░░░░] 10% | Time: 4.8s | Overall: 12%
-[TRANSCODE] 🔄 1080p: [████████████████████] 100% | Time: 45.2s | Overall: 30%
-[TRANSCODE] ✅ 1080p transcoding complete in 45.2s
-
-...
-
-[TRANSCODE] ☁️ PHASE 5: Uploading transcoded files to R2
-[TRANSCODE] 📤 Uploading 1/4: 1080p
-[R2] 📤 Uploading to R2
-[R2] ✅ Upload complete
-[TRANSCODE] ✅ 1080p uploaded (125.50 MB)
-
-[TRANSCODE] 💾 PHASE 6: Finalizing in database
-[TRANSCODE] ✅ Video status updated to 'completed'
-[TRANSCODE] 🎉 Job abc-123 completed successfully!
-[TRANSCODE] 📊 Generated 4 quality variants
-================================================================================
-```
-
----
-
-## ⚙️ Configuration
-
-### Worker Concurrency
-
-**User Queue:**
-- Concurrency: 2 (processes 2 jobs simultaneously)
-- Timeout: 10 minutes per job
-
-**Creator Queue:**
-- Concurrency: 1 (processes 1 job at a time)
-- Timeout: 30 minutes per job (larger files)
-
-### Quality Presets
-
-| Quality | Resolution | Video Bitrate | Audio Bitrate |
-|---------|-----------|---------------|---------------|
-| 1080p   | 1920×1080 | 5000k         | 192k          |
-| 720p    | 1280×720  | 2500k         | 128k          |
-| 480p    | 854×480   | 1000k         | 96k           |
-| 360p    | 640×360   | 600k          | 64k           |
-
----
-
-## 🔧 Scaling
-
-### Horizontal Scaling
-Run multiple instances of the transcoding engine:
+Production:
 
 ```bash
-# Terminal 1
-cd transcoding-engine
-yarn dev
-
-# Terminal 2
-cd transcoding-engine
-yarn dev
-
-# Terminal 3
-cd transcoding-engine
-yarn dev
+npm run build
+npm start
 ```
 
-All instances will:
-- Connect to the same Redis queue
-- Process jobs in parallel
-- Automatically distribute workload
+`npm run worker` starts the same process once, without file watching.
 
-### Vertical Scaling
-Increase concurrency in `src/index.ts`:
+## Pipeline
 
-```typescript
-userWorker = new Worker<TranscodeJobData>(
-  'user-transcode-queue',
-  processJob,
-  {
-    connection,
-    concurrency: 4, // Increase from 2 to 4
-    lockDuration: 600000,
-  }
-);
-```
+A job looks like `{ videoId, userId, userType, r2Key, qualities }`.
 
----
+1. **Download.** The original file is pulled from the raw R2 bucket into the OS temp directory, under `videomanch-transcoding/{videoId}/`.
+2. **Probe.** FFprobe reads duration, dimensions, codec, bitrate, and frame rate. Audio-only files and videos smaller than 64×64 are rejected.
+3. **Transcode to HLS.** Each requested quality at or below the source height is encoded with libx264 and AAC. Segments are about 10 seconds. A `master.m3u8` lists the variants. Qualities above the source are skipped so the worker does not upscale.
+4. **Thumbnails.** Three 1280×720 JPEGs are taken near 10%, 30%, and 50% of the duration, capped at 2s, 10s, and 20s.
+5. **Upload.** Playlists, `.ts` segments, and thumbnails are uploaded with retries. Segments are cached for one year. Playlists are cached for one hour.
+6. **Finalize.** MongoDB is updated to `completed` with the master playlist key, per-quality playlist keys, thumbnail keys, duration, and timing stats. On failure the video status is set to `failed` and the temp directory is removed.
 
-## 🛑 Graceful Shutdown
+Object keys use `{userType}/{userId}/{videoId}/`, for example `user/abc/vid-1/master.m3u8`.
 
-The engine handles shutdown gracefully:
+## Quality presets
 
-1. **Stop accepting new jobs**
-2. **Wait for active jobs to complete** (max 5 minutes)
-3. **Close worker connections**
-4. **Disconnect from MongoDB and Redis**
-5. **Exit cleanly**
+| Quality | Resolution | Video bitrate | Audio bitrate |
+|---------|------------|---------------|---------------|
+| 1080p   | 1920×1080  | 5000k         | 192k          |
+| 720p    | 1280×720   | 2500k         | 128k          |
+| 480p    | 854×480    | 1000k         | 96k           |
+| 360p    | 640×360    | 600k          | 64k           |
+| 240p    | 426×240    | 400k          | 48k           |
 
-Trigger shutdown:
-```bash
-Ctrl+C  # or send SIGTERM/SIGINT
-```
+## Concurrency
 
----
+Each replica sizes its workers from available CPU (`CPU_UTILIZATION_TARGET`, default `0.8`, minus `RESERVED_CPU_CORES`, default `1`). Override that with:
 
-## 🐛 Troubleshooting
+- `WORKER_CONCURRENCY`
+- `USER_WORKER_CONCURRENCY`
+- `CREATOR_WORKER_CONCURRENCY`
 
-### FFmpeg not found
-```bash
-# Check if FFmpeg is installed
-which ffmpeg
-which ffprobe
+The creator queue runs unless `ENABLE_CREATOR_WORKER=false`.
 
-# If not found, install it
-brew install ffmpeg  # macOS
-sudo apt install ffmpeg  # Ubuntu
-```
+`GLOBAL_MAX_TRANSCODE_JOBS` caps in-flight transcodes across all replicas through a Redis semaphore. Leave it unset to limit each replica only by its own CPU budget.
 
-### Redis connection error
-```bash
-# Check if Redis is running
-redis-cli ping
-# Should return: PONG
+User jobs use a 10 minute BullMQ lock. Creator jobs use a 30 minute lock. FFmpeg itself is allowed up to 60 minutes per quality.
 
-# Start Redis if not running
-redis-server
-```
+## Scaling
 
-### MongoDB connection error
-```bash
-# Check if MongoDB is running
-mongosh --eval "db.runCommand({ ping: 1 })"
+Start more than one replica against the same `REDIS_URL` and `MONGODB_URI`. BullMQ distributes jobs. Set `GLOBAL_MAX_TRANSCODE_JOBS` when several replicas share one machine or one Redis, so they do not all encode at once.
 
-# Start MongoDB if not running
-mongod
-```
+Railway deploys from the `Dockerfile` (`railway.toml`). The image installs FFmpeg, builds TypeScript, then prunes dev dependencies and runs `node dist/index.js`.
 
-### Jobs not being processed
-1. Check if backend is adding jobs to the queue
-2. Verify Redis connection
-3. Check worker logs for errors
-4. Ensure queue names match (`user-transcode-queue`, `creator-transcode-queue`)
+## Shutdown
 
----
+`Ctrl+C`, `SIGINT`, or `SIGTERM` pauses both workers, waits up to 5 minutes for the job already in progress, then closes Redis and MongoDB.
 
-## 📁 Project Structure
+## Project layout
 
 ```
-transcoding-engine/
+video-munch-transcoding-engine/
 ├── src/
 │   ├── config/
-│   │   ├── database.ts      # MongoDB connection
-│   │   ├── redis.ts         # Redis connection
-│   │   └── r2.ts            # Cloudflare R2 config
-│   ├── models/
-│   │   └── Video.ts         # Video model (MongoDB)
+│   │   ├── database.ts
+│   │   ├── redis.ts
+│   │   └── r2.ts
+│   ├── models/Video.ts
 │   ├── services/
-│   │   ├── ffmpegService.ts # FFmpeg operations
-│   │   └── r2Service.ts     # R2 file operations
-│   ├── types/
-│   │   └── index.ts         # TypeScript types
-│   └── index.ts             # Main worker entry point
-├── .env.example             # Environment variables template
-├── package.json             # Dependencies and scripts
-├── tsconfig.json            # TypeScript configuration
-└── README.md                # This file
+│   │   ├── ffmpegService.ts    # probe, HLS encode, master playlist, thumbnails
+│   │   └── r2Service.ts
+│   ├── types/index.ts
+│   └── index.ts                # queue workers and the VOD pipeline
+├── .env.example
+├── Dockerfile
+├── package.json
+├── railway.toml
+└── tsconfig.json
 ```
 
----
+## Backend contract
 
-## 🔗 Integration with Backend
-
-The backend API adds jobs to the queue:
+The backend enqueues the job. This worker does not expose HTTP.
 
 ```typescript
-// backend/src/routes/upload.ts
 await queueService.addTranscodeJob({
   videoId,
   userId,
-  userType,
+  userType, // "user" | "creator"
   r2Key,
-  qualities: ['1080p', '720p', '480p']
+  qualities: ["1080p", "720p", "480p", "360p"],
 });
 ```
 
-The transcoding engine picks up and processes these jobs automatically.
+Queue names must stay `user-transcode-queue` and `creator-transcode-queue`.
 
----
-
-## 📝 Environment Variables
+## Environment variables
 
 | Variable | Description | Example |
 |----------|-------------|---------|
 | `MONGODB_URI` | MongoDB connection string | `mongodb://localhost:27017/video` |
-| `REDIS_URL` | Redis connection string | `redis://localhost:6379` |
-| `R2_ACCOUNT_ID` | Cloudflare R2 account ID | `abc123...` |
+| `REDIS_URL` | Redis connection string. Use `rediss://` for TLS. | `redis://localhost:6379` |
+| `R2_ACCOUNT_ID` | Cloudflare account ID | `abc123` |
 | `R2_ACCESS_KEY_ID` | R2 access key | `your_key` |
 | `R2_SECRET_ACCESS_KEY` | R2 secret key | `your_secret` |
-| `R2_BUCKET_RAW` | Bucket for original videos | `video-raw` |
-| `R2_BUCKET_TRANSCODED` | Bucket for transcoded videos | `video-transcoded` |
-| `R2_BUCKET_THUMBNAILS` | Bucket for generated thumbnails | `video-thumbnails` |
-| `R2_PUBLIC_URL` | Public URL for R2 bucket | `https://cdn.example.com` |
-| `FFMPEG_PATH` | Custom FFmpeg binary path (optional) | `/usr/local/bin/ffmpeg` |
-| `FFPROBE_PATH` | Custom FFprobe binary path (optional) | `/usr/local/bin/ffprobe` |
+| `R2_BUCKET_RAW` | Original uploads | `videos-raw-upload` |
+| `R2_BUCKET_TRANSCODED` | HLS playlists and segments | `videos-transcoded-data` |
+| `R2_BUCKET_THUMBNAILS` | JPEG thumbnails | `videos-thumbnails` |
+| `R2_PUBLIC_URL` | Public base URL for transcoded objects | `https://cdn.example.com` |
+| `R2_PUBLIC_URL_THUMBNAILS` | Optional public base URL for thumbnails | `https://thumbs.example.com` |
+| `FFMPEG_PATH` | Optional ffmpeg binary | `/usr/bin/ffmpeg` |
+| `FFPROBE_PATH` | Optional ffprobe binary | `/usr/bin/ffprobe` |
+| `ENABLE_CREATOR_WORKER` | Set to `false` to run only the user queue | `true` |
+| `GLOBAL_MAX_TRANSCODE_JOBS` | Optional cluster-wide encode cap | `16` |
 
----
+See `.env.example` for the CPU and semaphore tunables.
 
-## 🚀 Deployment
+## Troubleshooting
 
-### Docker (Recommended)
+**FFmpeg is missing.** `which ffmpeg` and `which ffprobe` should both resolve. Set `FFMPEG_PATH` and `FFPROBE_PATH` if the binaries are not on `PATH`.
 
-```dockerfile
-FROM node:18-alpine
+**Redis.** `redis-cli ping` should return `PONG`. BullMQ needs `maxRetriesPerRequest: null`, which this worker already sets.
 
-# Install FFmpeg
-RUN apk add --no-cache ffmpeg
+**MongoDB.** Confirm `MONGODB_URI` and that the Video collection uses the same `videoId` the backend enqueued.
 
-WORKDIR /app
+**Jobs sit in the queue.** The backend must push to `user-transcode-queue` or `creator-transcode-queue`, and this process must be running against that same Redis.
 
-COPY package*.json ./
-RUN npm install --production
-
-COPY . .
-RUN npm run build
-
-CMD ["node", "dist/index.js"]
-```
-
-### PM2 (Process Manager)
-
-```bash
-# Install PM2
-npm install -g pm2
-
-# Start worker
-pm2 start dist/index.js --name transcoding-engine
-
-# Monitor
-pm2 logs transcoding-engine
-pm2 monit
-```
-
----
-
-## 📊 Monitoring
-
-### Check Queue Status
-```bash
-# In backend directory
-yarn queue:status
-```
-
-### View Logs
-```bash
-# Real-time logs
-tail -f logs/transcoding.log
-
-# PM2 logs
-pm2 logs transcoding-engine
-```
-
----
-
-## 🎯 Performance Tips
-
-1. **Use SSD storage** for temp directory (`/tmp`)
-2. **Allocate sufficient RAM** (4GB+ recommended)
-3. **Use multiple workers** for parallel processing
-4. **Monitor CPU usage** (FFmpeg is CPU-intensive)
-5. **Consider GPU acceleration** for large-scale deployments
-
----
-
-## 📄 License
-
-Part of the I_TUBE platform.
-
----
-
-## 🤝 Contributing
-
-This is a standalone microservice. To contribute:
-1. Ensure changes don't break backend integration
-2. Test with various video formats
-3. Update logs and documentation
-
----
-
-**Built with ❤️ for scalable video processing**
+**A long video is retried while it is still encoding.** The BullMQ lock (10 minutes on the user queue, 30 minutes on the creator queue) can expire before a 60-minute-per-quality ffmpeg run finishes. Raise `lockDuration` in `src/index.ts` if jobs are marked stalled mid-encode.
